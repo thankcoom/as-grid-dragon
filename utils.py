@@ -55,6 +55,19 @@ def normalize_symbol(symbol_input: str) -> Tuple[Optional[str], Optional[str], O
         
         如果無法識別，返回 (None, None, None, None)
     """
+    # 如果已經是 CCXT 格式 (包含 '/' 和 ':')，直接解析
+    if '/' in symbol_input and ':' in symbol_input:
+        try:
+            parts = symbol_input.split('/')
+            coin = parts[0].strip()
+            quote_parts = parts[1].split(':')
+            quote = quote_parts[0].strip()
+            raw = coin + quote
+            return raw, symbol_input, coin, quote
+        except Exception:
+            pass
+    
+    # 移除所有分隔符
     s = symbol_input.upper().strip().replace("/", "").replace(":", "").replace("-", "").replace("_", "")
 
     if s in SYMBOL_MAP:

@@ -67,6 +67,7 @@ class MaxGridBot:
         self.dgt_manager = DGTBoundaryManager(config.dgt)
         self.dynamic_grid = DynamicGridManager()
         self.last_grid_time: Dict[str, float] = {}
+        self.last_order_times: Dict[str, float] = {}  # 每個方向的最後下單時間 ({symbol}_{side})
         self.grid_interval = 0.5
         # User Data Stream
         self.listen_key: Optional[str] = None
@@ -92,6 +93,12 @@ class MaxGridBot:
             # 使用 normalize_symbol 重新解析，確保資料正確
             _, real_ccxt, _, _ = normalize_symbol(key)
             
+            # 如果 key 本身已經是 CCXT 格式，且與 ccxt_symbol 一致，直接使用
+            if key == sym_cfg.ccxt_symbol and '/' in key:
+                new_symbols[key] = sym_cfg
+                print(f"[Bot] 使用配置 Key: {key}")
+                continue
+            
             # 如果解析失敗，嘗試用 ccxt_symbol 解析
             if not real_ccxt:
                 _, real_ccxt, _, _ = normalize_symbol(sym_cfg.ccxt_symbol)
@@ -99,6 +106,7 @@ class MaxGridBot:
             # 遷移判定: (Key 不正確) 或 (Config 內的 ccxt_symbol 不正確)
             if real_ccxt and (key != real_ccxt or sym_cfg.ccxt_symbol != real_ccxt):
                 logger.warning(f"[Bot] 遷移配置: {key} -> {real_ccxt}")
+                print(f"[Bot] 遷移配置: {key} ({sym_cfg.ccxt_symbol}) -> {real_ccxt}")
                 
                 # 修正 Config 對象內的數據
                 sym_cfg.ccxt_symbol = real_ccxt
@@ -586,99 +594,386 @@ class MaxGridBot:
         處理 Ticker 更新 (標準化 TickerUpdate 格式)
 
         Args:
-            raw_symbol: 原始交易對符號 (如 XRPUSDC 或 XRP_USDT)
+            raw_symbol: 原始交易對符號 (各交易所格式不同)
+                - Binance: xrpusdt (小寫無分隔符)
+                - Bitget/Bybit: XRPUSDT (大寫無分隔符)
+                - Gate.io: XRP_USDT (大寫下劃線)
             ticker_update: exchanges.base.TickerUpdate 實例
         """
-        # 改進符號匹配邏輯 - 先嘗試直接匹配，再標準化匹配
         matched = False
         matched_cfg = None
         
-        # 1. 首先嘗試原始符號直接匹配 (對應 ccxt_symbol)
-        for cfg in self.config.symbols.values():
-            if not cfg.enabled:
-                continue
-            # 檢查原始符號是否與 ccxt_symbol 匹配
-            if raw_symbol == cfg.ccxt_symbol and cfg.ccxt_symbol in self.state.symbols:
-                matched_cfg = cfg
-                matched = True
-                break
+        # === 多層次符號匹配策略 ===
         
-        # 2. 如果沒有直接匹配，嘗試標準化匹配
-        if not matched:
-            normalized_raw = normalize_symbol(raw_symbol)[0]
+        # 1. 直接匹配 ccxt_symbol (處理 CCXT 格式的消息)
+        if '/' in raw_symbol or ':' in raw_symbol:
             for cfg in self.config.symbols.values():
                 if not cfg.enabled:
                     continue
-                cfg_normalized = normalize_symbol(cfg.symbol)[0]
-                
-                if cfg_normalized == normalized_raw and cfg.ccxt_symbol in self.state.symbols:
+                if raw_symbol == cfg.ccxt_symbol and cfg.ccxt_symbol in self.state.symbols:
                     matched_cfg = cfg
                     matched = True
                     break
         
-        # 3. 如果還是沒有匹配，嘗試適配器的符號轉換
+        # 2. 使用適配器反向轉換 WS 格式到 CCXT (最準確的方法)
+        if not matched:
+            try:
+                ccxt_from_ws = self.adapter.convert_symbol_to_ccxt(raw_symbol)
+                for cfg in self.config.symbols.values():
+                    if not cfg.enabled:
+                        continue
+                    if ccxt_from_ws == cfg.ccxt_symbol and cfg.ccxt_symbol in self.state.symbols:
+                        matched_cfg = cfg
+                        matched = True
+                        break
+            except Exception as e:
+                logger.debug(f"[Bot] 適配器轉換失敗: {raw_symbol} -> {e}")
+        
+        # 3. 雙向 WS 格式匹配
         if not matched:
             for cfg in self.config.symbols.values():
                 if not cfg.enabled:
                     continue
-                # 使用適配器轉換原始符號到WS格式，再反向匹配
                 try:
+                    # 將配置的符號轉換為 WS 格式，然後比較
                     ws_symbol = self.adapter.convert_symbol_to_ws(cfg.symbol)
                     if raw_symbol.upper() == ws_symbol.upper():
-                        matched_cfg = cfg
-                        matched = True
-                        break
-                    # 或者嘗試將WS格式轉換回CCXT格式
-                    ccxt_from_ws = self.adapter.convert_symbol_to_ccxt(raw_symbol)
-                    if ccxt_from_ws == cfg.ccxt_symbol:
-                        matched_cfg = cfg
-                        matched = True
-                        break
+                        if cfg.ccxt_symbol in self.state.symbols:
+                            matched_cfg = cfg
+                            matched = True
+                            break
                 except Exception:
                     continue
         
-        if matched and matched_cfg:
-            sym_state = self.state.symbols[matched_cfg.ccxt_symbol]
+        # 4. 標準化匹配 (normalize_symbol)
+        if not matched:
+            normalized_raw = normalize_symbol(raw_symbol)[0]
+            if normalized_raw:
+                for cfg in self.config.symbols.values():
+                    if not cfg.enabled:
+                        continue
+                    cfg_normalized = normalize_symbol(cfg.symbol)[0]
+                    if cfg_normalized == normalized_raw and cfg.ccxt_symbol in self.state.symbols:
+                        matched_cfg = cfg
+                        matched = True
+                        break
+        
+        # 匹配失敗處理
+        if not matched or not matched_cfg:
+            logger.warning(f"[Bot] 無法匹配交易對: {raw_symbol}")
+            print(f"[Ticker] ⚠️ 無法匹配交易對: {raw_symbol}")
+            return
+        
+        # 更新價格和執行網格
+        sym_state = self.state.symbols[matched_cfg.ccxt_symbol]
+        
+        old_price = sym_state.latest_price
+        sym_state.latest_price = ticker_update.price
+        sym_state.best_bid = ticker_update.bid
+        sym_state.best_ask = ticker_update.ask
+
+        # 更新領先指標
+        self.leading_indicator.update_spread(matched_cfg.ccxt_symbol, sym_state.best_bid, sym_state.best_ask)
+        self.dynamic_grid.update_price(matched_cfg.ccxt_symbol, sym_state.latest_price)
+
+        if self.config.bandit.contextual_enabled:
+            self.bandit_optimizer.update_price(sym_state.latest_price)
+
+        # 執行網格調整 (與終端版 adjust_grid 邏輯一致)
+        await self._adjust_grid(matched_cfg)
+
+
+    async def _adjust_grid(self, cfg):
+        """
+        網格調整入口 (與 Terminal 版 adjust_grid 一致)
+        
+        分離無倉/有倉處理邏輯:
+        - 無倉時: 直接在 best_bid/best_ask 下單開倉，冷卻 10 秒
+        - 有倉時: 檢查 _should_adjust_grid 後才調用 _place_grid
+        """
+        ccxt_sym = cfg.ccxt_symbol
+        sym_state = self.state.symbols.get(ccxt_sym)
+        if not sym_state:
+            return
+        
+        price = sym_state.latest_price
+        if price <= 0:
+            return
+        
+        # DGT 動態邊界管理 (與終端版一致)
+        if self.config.dgt.enabled:
+            if ccxt_sym not in self.dgt_manager.boundaries:
+                self.dgt_manager.initialize_boundary(
+                    ccxt_sym, price, cfg.grid_spacing, num_grids=10
+                )
+            accumulated = self.dgt_manager.accumulated_profits.get(ccxt_sym, 0)
+            reset, reset_info = self.dgt_manager.check_and_reset(ccxt_sym, price, accumulated)
+            if reset and reset_info:
+                logger.info(f"[DGT] {cfg.symbol} 邊界重置 #{reset_info['reset_count']}: "
+                           f"{reset_info['direction']}破, 中心價 {reset_info['old_center']:.4f} -> {reset_info['new_center']:.4f}")
+        
+        # Bandit 參數應用 (與終端版一致)
+        if self.config.bandit.enabled:
+            bandit_params = self.bandit_optimizer.get_current_params()
+            cfg.grid_spacing = bandit_params.grid_spacing
+            cfg.take_profit_spacing = bandit_params.take_profit_spacing
+            if self.config.max_enhancement.all_enhancements_enabled:
+                self.config.max_enhancement.gamma = bandit_params.gamma
+        
+        # 更新價格歷史
+        self.dynamic_grid.update_price(ccxt_sym, price)
+        
+        # 檢查並減倉 (如果雙向持倉都過大)
+        await self._check_and_reduce_single(cfg, sym_state)
+        
+        # 獲取精度信息
+        precision = self.precision_info.get(ccxt_sym, {"price": 4, "amount": 0, "min_notional": 5})
+        
+        # === 多頭處理 (與終端版一致) ===
+        if sym_state.long_position == 0:
+            # 無倉: 直接下單開倉，冷卻 10 秒
+            last_long = self.last_order_times.get(f"{ccxt_sym}_long", 0)
+            if time.time() - last_long > 10:
+                await self.cancel_orders_for_side(ccxt_sym, 'long')
+                qty = self._get_adjusted_quantity(cfg, sym_state, 'long', False)
+                qty = round(qty, precision.get('amount', 0))
+                entry_price = round(sym_state.best_bid, precision.get('price', 4)) if sym_state.best_bid > 0 else round(price * 0.999, precision.get('price', 4))
+                if qty > 0 and entry_price > 0:
+                    print(f"\n[Grid] {cfg.symbol} | 價: {price:.4f} | 多: 0 | 空: {sym_state.short_position:.1f}")
+                    print(f"[Grid]   多頭開倉: BUY {qty} @ {entry_price}")
+                    try:
+                        await asyncio.to_thread(
+                            self.adapter.create_limit_order,
+                            ccxt_sym, 'buy', qty, entry_price,
+                            position_side='LONG', reduce_only=False
+                        )
+                        self.last_order_times[f"{ccxt_sym}_long"] = time.time()
+                        sym_state.last_grid_price_long = price
+                    except Exception as e:
+                        print(f"[Grid] ❌ 多頭開倉失敗: {e}")
+                        logger.error(f"[Bot] 多頭開倉失敗 {cfg.symbol}: {e}")
+        else:
+            # 有倉: 檢查是否需要調整網格
+            if self._should_adjust_grid(cfg, sym_state, 'long'):
+                await self._place_grid_side(cfg, sym_state, 'long', precision)
+                sym_state.last_grid_price_long = price
+        
+        # === 空頭處理 (與終端版一致) ===
+        if sym_state.short_position == 0:
+            # 無倉: 直接下單開倉，冷卻 10 秒
+            last_short = self.last_order_times.get(f"{ccxt_sym}_short", 0)
+            if time.time() - last_short > 10:
+                await self.cancel_orders_for_side(ccxt_sym, 'short')
+                qty = self._get_adjusted_quantity(cfg, sym_state, 'short', False)
+                qty = round(qty, precision.get('amount', 0))
+                entry_price = round(sym_state.best_ask, precision.get('price', 4)) if sym_state.best_ask > 0 else round(price * 1.001, precision.get('price', 4))
+                if qty > 0 and entry_price > 0:
+                    print(f"\n[Grid] {cfg.symbol} | 價: {price:.4f} | 多: {sym_state.long_position:.1f} | 空: 0")
+                    print(f"[Grid]   空頭開倉: SELL {qty} @ {entry_price}")
+                    try:
+                        await asyncio.to_thread(
+                            self.adapter.create_limit_order,
+                            ccxt_sym, 'sell', qty, entry_price,
+                            position_side='SHORT', reduce_only=False
+                        )
+                        self.last_order_times[f"{ccxt_sym}_short"] = time.time()
+                        sym_state.last_grid_price_short = price
+                    except Exception as e:
+                        print(f"[Grid] ❌ 空頭開倉失敗: {e}")
+                        logger.error(f"[Bot] 空頭開倉失敗 {cfg.symbol}: {e}")
+        else:
+            # 有倉: 檢查是否需要調整網格
+            if self._should_adjust_grid(cfg, sym_state, 'short'):
+                await self._place_grid_side(cfg, sym_state, 'short', precision)
+                sym_state.last_grid_price_short = price
+
+    async def _place_grid_side(self, cfg, sym_state, side: str, precision: dict):
+        """
+        掛出單一方向的網格訂單 (與 Terminal 版 _place_grid 一致)
+        
+        Args:
+            cfg: 交易對配置
+            sym_state: 交易對狀態
+            side: 'long' 或 'short'
+            precision: 精度信息
+        """
+        ccxt_sym = cfg.ccxt_symbol
+        price = sym_state.latest_price
+        
+        # 獲取動態間距
+        tp_spacing, gs_spacing = self._get_dynamic_spacing(cfg, sym_state)
+        
+        # 獲取調整後的數量
+        tp_qty = self._get_adjusted_quantity(cfg, sym_state, side, True)
+        base_qty = self._get_adjusted_quantity(cfg, sym_state, side, False)
+        
+        if side == 'long':
+            my_position = sym_state.long_position
+            opposite_position = sym_state.short_position
+            dead_mode_flag = sym_state.long_dead_mode
+            pending_tp_orders = sym_state.sell_long_orders
+        else:
+            my_position = sym_state.short_position
+            opposite_position = sym_state.long_position
+            dead_mode_flag = sym_state.short_dead_mode
+            pending_tp_orders = sym_state.buy_short_orders
+        
+        # 使用 GridStrategy 判斷模式
+        is_dead = GridStrategy.is_dead_mode(my_position, cfg.position_threshold)
+        
+        print(f"\n[Grid] {cfg.symbol} | 價: {price:.4f} | 多: {sym_state.long_position:.1f} | 空: {sym_state.short_position:.1f}")
+        
+        try:
+            if is_dead:
+                # === 裝死模式 ===
+                if not dead_mode_flag:
+                    if side == 'long':
+                        sym_state.long_dead_mode = True
+                    else:
+                        sym_state.short_dead_mode = True
+                    logger.info(f"[MAX] {cfg.symbol} {side}頭進入裝死模式 (持倉:{my_position})")
+                    print(f"[Grid]   {side}頭進入裝死模式 (持倉:{my_position})")
+                
+                if pending_tp_orders <= 0:
+                    # 計算裝死模式價格
+                    special_price = GridStrategy.calculate_dead_mode_price(
+                        price, my_position, opposite_position, side
+                    )
+                    special_price = round(special_price, precision.get('price', 4))
+                    tp_qty = round(min(tp_qty, my_position), precision.get('amount', 0))
+                    
+                    if tp_qty > 0:
+                        if side == 'long':
+                            print(f"[Grid]   多頭裝死止盈: SELL {tp_qty} @ {special_price}")
+                            await asyncio.to_thread(
+                                self.adapter.create_limit_order,
+                                ccxt_sym, 'sell', tp_qty, special_price,
+                                position_side='LONG', reduce_only=True
+                            )
+                        else:
+                            print(f"[Grid]   空頭裝死止盈: BUY {tp_qty} @ {special_price}")
+                            await asyncio.to_thread(
+                                self.adapter.create_limit_order,
+                                ccxt_sym, 'buy', tp_qty, special_price,
+                                position_side='SHORT', reduce_only=True
+                            )
+                        logger.info(f"[MAX] {cfg.symbol} {side}頭裝死止盈@{special_price:.4f}")
+            else:
+                # === 正常模式 ===
+                if dead_mode_flag:
+                    if side == 'long':
+                        sym_state.long_dead_mode = False
+                    else:
+                        sym_state.short_dead_mode = False
+                    logger.info(f"[MAX] {cfg.symbol} {side}頭離開裝死模式")
+                    print(f"[Grid]   {side}頭離開裝死模式")
+                
+                await self.cancel_orders_for_side(ccxt_sym, side)
+                
+                # 計算正常模式價格
+                tp_price, entry_price = GridStrategy.calculate_grid_prices(
+                    price, tp_spacing, gs_spacing, side
+                )
+                tp_price = round(tp_price, precision.get('price', 4))
+                entry_price = round(entry_price, precision.get('price', 4))
+                tp_qty = round(min(tp_qty, my_position), precision.get('amount', 0))
+                base_qty = round(base_qty, precision.get('amount', 0))
+                
+                if side == 'long':
+                    if my_position > 0 and tp_qty > 0:
+                        print(f"[Grid]   多頭止盈: SELL {tp_qty} @ {tp_price}")
+                        await asyncio.to_thread(
+                            self.adapter.create_limit_order,
+                            ccxt_sym, 'sell', tp_qty, tp_price,
+                            position_side='LONG', reduce_only=True
+                        )
+                    if base_qty > 0:
+                        print(f"[Grid]   多頭補倉: BUY {base_qty} @ {entry_price}")
+                        await asyncio.to_thread(
+                            self.adapter.create_limit_order,
+                            ccxt_sym, 'buy', base_qty, entry_price,
+                            position_side='LONG', reduce_only=False
+                        )
+                else:
+                    if my_position > 0 and tp_qty > 0:
+                        print(f"[Grid]   空頭止盈: BUY {tp_qty} @ {tp_price}")
+                        await asyncio.to_thread(
+                            self.adapter.create_limit_order,
+                            ccxt_sym, 'buy', tp_qty, tp_price,
+                            position_side='SHORT', reduce_only=True
+                        )
+                    if base_qty > 0:
+                        print(f"[Grid]   空頭補倉: SELL {base_qty} @ {entry_price}")
+                        await asyncio.to_thread(
+                            self.adapter.create_limit_order,
+                            ccxt_sym, 'sell', base_qty, entry_price,
+                            position_side='SHORT', reduce_only=False
+                        )
+                
+                logger.info(f"[MAX] {cfg.symbol} {side}頭 止盈@{tp_price:.4f}({tp_qty:.1f}) "
+                           f"補倉@{entry_price:.4f}({base_qty:.1f}) [TP:{tp_spacing*100:.2f}%/GS:{gs_spacing*100:.2f}%]")
+        
+        except Exception as e:
+            print(f"[Grid] ❌ {cfg.symbol} {side}頭下單失敗: {e}")
+            logger.error(f"[Bot] {cfg.symbol} {side}頭下單失敗: {e}")
+
+    async def _check_and_reduce_single(self, cfg, sym_state):
+        """
+        檢查單個交易對並減倉 (與終端版 _check_and_reduce_positions 邏輯一致)
+        """
+        REDUCE_COOLDOWN = 60
+        ccxt_symbol = cfg.ccxt_symbol
+        local_threshold = cfg.position_threshold * 0.8
+        reduce_qty = cfg.position_threshold * 0.1
+        
+        last_reduce = self.state.last_reduce_time.get(ccxt_symbol, 0)
+        if time.time() - last_reduce < REDUCE_COOLDOWN:
+            return
+        
+        if sym_state.long_position >= local_threshold and sym_state.short_position >= local_threshold:
+            logger.info(f"[風控] {cfg.symbol} 多空持倉均超過 {local_threshold}，開始雙向減倉")
+            print(f"[風控] {cfg.symbol} 多空持倉均超過 {local_threshold}，開始雙向減倉")
             
-            # 更新價格信息
-            old_price = sym_state.latest_price
-            sym_state.latest_price = ticker_update.price
-            sym_state.best_bid = ticker_update.bid
-            sym_state.best_ask = ticker_update.ask
-
-            # 添加調試日誌
-            if old_price != sym_state.latest_price:
-                logger.debug(f"[Ticker] {matched_cfg.symbol} 價格更新: {old_price} -> {sym_state.latest_price}")
-
-            # 更新領先指標
-            self.leading_indicator.update_spread(matched_cfg.ccxt_symbol, sym_state.best_bid, sym_state.best_ask)
-            self.dynamic_grid.update_price(matched_cfg.ccxt_symbol, sym_state.latest_price)
-
-            if self.config.bandit.contextual_enabled:
-                self.bandit_optimizer.update_price(sym_state.latest_price)
-
-            # 總是嘗試執行網格交易，而不僅僅是間隔控制
-            # 這樣可以確保價格變化時立即響應
-            await self._place_grid(matched_cfg)
-            
-            # 如果價格變動較大，也更新時間戳以避免過於頻繁的網格操作
-            now = time.time()
-            last = self.last_grid_time.get(matched_cfg.ccxt_symbol, 0)
-            if now - last >= self.grid_interval:
-                self.last_grid_time[matched_cfg.ccxt_symbol] = now
-
+            try:
+                if sym_state.long_position > 0:
+                    await asyncio.to_thread(
+                        self.adapter.create_market_order,
+                        ccxt_symbol, 'sell', reduce_qty,
+                        position_side='LONG', reduce_only=True
+                    )
+                    logger.info(f"[風控] {cfg.symbol} 市價平多 {reduce_qty}")
+                
+                if sym_state.short_position > 0:
+                    await asyncio.to_thread(
+                        self.adapter.create_market_order,
+                        ccxt_symbol, 'buy', reduce_qty,
+                        position_side='SHORT', reduce_only=True
+                    )
+                    logger.info(f"[風控] {cfg.symbol} 市價平空 {reduce_qty}")
+                
+                self.state.last_reduce_time[ccxt_symbol] = time.time()
+            except Exception as e:
+                logger.error(f"[風控] {cfg.symbol} 減倉失敗: {e}")
 
     async def _place_grid(self, cfg):
         """
-        掛出網格訂單 (與 Terminal 版一致)
+        掛出網格訂單 (保留舊方法兼容初始網格)
         
         邏輯:
         - 持倉為 0 時: 在 best_bid/best_ask 下單開倉
         - 有持倉時: 下止盈單和補倉單
         """
         ccxt_sym = cfg.ccxt_symbol
+        
+        # 防止過於頻繁下單，檢查時間間隔
+        now = time.time()
+        last = self.last_grid_time.get(ccxt_sym, 0)
+        if now - last < self.grid_interval:
+            return  # 距離上次下單太近，跳過
+        
         sym_state = self.state.symbols.get(ccxt_sym)
         if not sym_state:
+            print(f"[Grid] ❌ {cfg.symbol} 狀態未找到")
             logger.warning(f"[Bot] 無法找到 {ccxt_sym} 的狀態")
             return
         
@@ -687,8 +982,11 @@ class MaxGridBot:
         if price <= 0:
             logger.debug(f"[Bot] {cfg.symbol} 價格未更新 ({price})，跳過本次網格操作")
             return
+        
+        print(f"\n[Grid] {cfg.symbol} | 價: {price:.4f} | 多: {sym_state.long_position:.1f} | 空: {sym_state.short_position:.1f}")
+        
         precision = self.precision_info.get(ccxt_sym, {"price": 4, "amount": 0, "min_notional": 5})
-        min_notional = precision.get("min_notional", 5) * 1.1  # +10% 緩衝，避免邊界問題
+        min_notional = precision.get("min_notional", 5) * 1.1
         
         # 動態計算滿足 min_notional 的最小數量
         import math
@@ -704,12 +1002,7 @@ class MaxGridBot:
         long_pos = sym_state.long_position
         short_pos = sym_state.short_position
         
-        # 計算實際名義價值
-        notional = base_qty * price
-        
         tp_spacing, gs_spacing = self._get_dynamic_spacing(cfg, sym_state)
-
-        # 計算策略決策
         long_decision = GridStrategy.get_grid_decision(
             price=price, my_position=long_pos, opposite_position=short_pos,
             position_threshold=cfg.position_threshold, position_limit=cfg.position_limit,
@@ -720,6 +1013,8 @@ class MaxGridBot:
             base_qty=base_qty, take_profit_spacing=tp_spacing, grid_spacing=gs_spacing, side='short')
         sym_state.long_dead_mode = long_decision['dead_mode']
         sym_state.short_dead_mode = short_decision['dead_mode']
+        
+
 
         try:
             # === 多頭處理 ===
@@ -730,6 +1025,7 @@ class MaxGridBot:
                 tp_price = round(long_decision['tp_price'], precision['price'])
                 tp_qty = round(min(long_decision['tp_qty'], long_pos), precision['amount'])
                 if tp_qty > 0:
+                    print(f"[Grid]   多頭止盈: SELL {tp_qty} @ {tp_price}")
                     await asyncio.to_thread(
                         self.adapter.create_limit_order,
                         ccxt_sym, 'sell', tp_qty, tp_price,
@@ -744,6 +1040,8 @@ class MaxGridBot:
                 if long_pos == 0 and sym_state.best_bid > 0:
                     entry_price = round(sym_state.best_bid, precision['price'])
                 if entry_qty > 0:
+                    order_type = '開倉' if long_pos == 0 else '補倉'
+                    print(f"[Grid]   多頭{order_type}: BUY {entry_qty} @ {entry_price}")
                     await asyncio.to_thread(
                         self.adapter.create_limit_order,
                         ccxt_sym, 'buy', entry_qty, entry_price,
@@ -758,6 +1056,7 @@ class MaxGridBot:
                 tp_price = round(short_decision['tp_price'], precision['price'])
                 tp_qty = round(min(short_decision['tp_qty'], short_pos), precision['amount'])
                 if tp_qty > 0:
+                    print(f"[Grid]   空頭止盈: BUY {tp_qty} @ {tp_price}")
                     await asyncio.to_thread(
                         self.adapter.create_limit_order,
                         ccxt_sym, 'buy', tp_qty, tp_price,
@@ -772,14 +1071,22 @@ class MaxGridBot:
                 if short_pos == 0 and sym_state.best_ask > 0:
                     entry_price = round(sym_state.best_ask, precision['price'])
                 if entry_qty > 0:
+                    order_type = '開倉' if short_pos == 0 else '補倉'
+                    print(f"[Grid]   空頭{order_type}: SELL {entry_qty} @ {entry_price}")
                     await asyncio.to_thread(
                         self.adapter.create_limit_order,
                         ccxt_sym, 'sell', entry_qty, entry_price,
                         position_side='SHORT', reduce_only=False
                     )
+            
+
+            self.last_grid_time[ccxt_sym] = time.time()
                     
         except Exception as e:
+            print(f"[Grid] ❌ {cfg.symbol} 下單失敗: {e}")
             logger.error(f"[Bot] {cfg.symbol} 下單失敗: {e}")
+            # 下單失敗也記錄時間，避免無限重試
+            self.last_grid_time[ccxt_sym] = time.time()
 
     async def cancel_orders_for_side(self, symbol: str, position_side: str):
         """
