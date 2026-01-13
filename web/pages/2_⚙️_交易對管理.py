@@ -185,12 +185,12 @@ def render_add_symbol():
 
             config = get_config()
 
-            if raw in config.symbols:
-                st.warning(f"{raw} 已存在")
+            # 新增交易對 (使用 CCXT 格式作為 Key)
+            if ccxt_sym in config.symbols:
+                st.warning(f"{ccxt_sym} 已存在")
                 return
 
-            # 新增交易對
-            config.symbols[raw] = SymbolConfig(
+            config.symbols[ccxt_sym] = SymbolConfig(
                 symbol=raw,
                 ccxt_symbol=ccxt_sym,
                 enabled=True,

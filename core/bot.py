@@ -100,6 +100,24 @@ class MaxGridBot:
         )
         self.adapter.load_markets()
 
+        # === 自動遷移舊配置 Key (Raw -> CCXT) ===
+        migrated = False
+        new_symbols = {}
+        for key, sym_cfg in list(self.config.symbols.items()):
+            # 如果 Key 不等於 ccxt_symbol，且 adapter 轉換後也不等於 Key (確保不是錯誤的配置)
+            if key != sym_cfg.ccxt_symbol:
+                logger.warning(f"[Bot] 遷移配置 Key: {key} -> {sym_cfg.ccxt_symbol}")
+                new_symbols[sym_cfg.ccxt_symbol] = sym_cfg
+                migrated = True
+            else:
+                new_symbols[key] = sym_cfg
+        
+        if migrated:
+            self.config.symbols = new_symbols
+            # 這裡不直接調用 save_config (web端負責保存)，但在核心運行時更新內存配置是必要的
+            # 如果希望持久化，可以調用 web.state.save_config (但這裡沒有引入)
+            # 暫時依賴用戶下次在 Web 保存，或期待 Bot 運行期間正確使用新 Key
+
         # === 舊版兼容: 保留 self.exchange 引用 ===
         self.exchange = self.adapter.exchange
 
