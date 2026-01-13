@@ -80,13 +80,66 @@ class BacktestManager:
         full_df = pd.concat(all_data, ignore_index=True)
         return full_df.sort_values('open_time').reset_index(drop=True)
 
-    def download_data(self, symbol_raw: str, ccxt_symbol: str, start_date: str, end_date: str) -> bool:
-        """下載歷史數據"""
+    def _create_exchange(self, exchange_type: str):
+        """
+        根據交易所類型創建 ccxt exchange 實例
+
+        Args:
+            exchange_type: 交易所類型 (binance, bybit, bitget, gate, okx)
+
+        Returns:
+            ccxt exchange 實例或 None
+        """
+        exchange_configs = {
+            "binance": {
+                "class": ccxt.binance,
+                "options": {"defaultType": "future"}
+            },
+            "bybit": {
+                "class": ccxt.bybit,
+                "options": {"defaultType": "linear"}  # USDT 永續合約
+            },
+            "bitget": {
+                "class": ccxt.bitget,
+                "options": {"defaultType": "swap"}  # 永續合約
+            },
+            "gate": {
+                "class": ccxt.gateio,
+                "options": {"defaultType": "swap"}
+            },
+        }
+
+        config = exchange_configs.get(exchange_type.lower())
+        if config is None:
+            return None
+
         try:
-            exchange = ccxt.binance({
-                'enableRateLimit': True,
-                'options': {'defaultType': 'future'}
+            return config["class"]({
+                "enableRateLimit": True,
+                "options": config["options"]
             })
+        except Exception as e:
+            console.print(f"[red]創建 {exchange_type} 交易所實例失敗: {e}[/]")
+            return None
+
+    def download_data(self, symbol_raw: str, ccxt_symbol: str, start_date: str, end_date: str,
+                      exchange_type: str = "binance") -> bool:
+        """
+        下載歷史數據
+
+        Args:
+            symbol_raw: 原始交易對符號 (如 "XRPUSDC")
+            ccxt_symbol: CCXT 格式符號 (如 "XRP/USDC:USDC")
+            start_date: 開始日期 (YYYY-MM-DD)
+            end_date: 結束日期 (YYYY-MM-DD)
+            exchange_type: 交易所類型 (binance, bybit, bitget, gate)
+        """
+        try:
+            # 根據交易所類型創建 exchange 實例
+            exchange = self._create_exchange(exchange_type)
+            if exchange is None:
+                console.print(f"[red]不支援的交易所: {exchange_type}[/]")
+                return False
 
             # 轉換為 ccxt 格式 (不帶 :USDC)
             fetch_symbol = ccxt_symbol.split(":")[0]  # "XRP/USDC"

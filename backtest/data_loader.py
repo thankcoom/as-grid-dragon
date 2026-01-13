@@ -325,12 +325,61 @@ class DataLoader:
         dates = [d["date"] for d in available]
         return min(dates), max(dates)
 
+    def _create_exchange(self, exchange_type: str):
+        """
+        根據交易所類型創建 ccxt exchange 實例
+
+        Args:
+            exchange_type: 交易所類型 (binance, bybit, bitget, gate, okx)
+
+        Returns:
+            ccxt exchange 實例或 None
+        """
+        try:
+            import ccxt
+        except ImportError:
+            print("❌ 請先安裝 ccxt: pip install ccxt")
+            return None
+
+        exchange_configs = {
+            "binance": {
+                "class": ccxt.binance,
+                "options": {"defaultType": "future"}
+            },
+            "bybit": {
+                "class": ccxt.bybit,
+                "options": {"defaultType": "linear"}  # USDT 永續合約
+            },
+            "bitget": {
+                "class": ccxt.bitget,
+                "options": {"defaultType": "swap"}  # 永續合約
+            },
+            "gate": {
+                "class": ccxt.gateio,
+                "options": {"defaultType": "swap"}
+            },
+        }
+
+        config = exchange_configs.get(exchange_type.lower())
+        if config is None:
+            return None
+
+        try:
+            return config["class"]({
+                "enableRateLimit": True,
+                "options": config["options"]
+            })
+        except Exception as e:
+            print(f"❌ 創建 {exchange_type} 交易所實例失敗: {e}")
+            return None
+
     def download(
         self,
         symbol: str,
         start_date: Union[str, datetime],
         end_date: Union[str, datetime],
-        interval: str = "1m"
+        interval: str = "1m",
+        exchange_type: str = "binance"
     ) -> bool:
         """
         下載歷史數據 (使用 ccxt)
@@ -340,6 +389,7 @@ class DataLoader:
             start_date: 開始日期
             end_date: 結束日期
             interval: K線間隔
+            exchange_type: 交易所類型 (binance, bybit, bitget, gate, okx)
 
         Returns:
             是否成功
@@ -361,11 +411,11 @@ class DataLoader:
         else:
             end = end_date
 
-        # 初始化交易所
-        exchange = ccxt.binance({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future'}
-        })
+        # 根據交易所類型初始化交易所
+        exchange = self._create_exchange(exchange_type)
+        if exchange is None:
+            print(f"❌ 不支援的交易所: {exchange_type}")
+            return False
 
         # 時間框架對應
         timeframe_map = {

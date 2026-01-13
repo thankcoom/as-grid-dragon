@@ -45,6 +45,14 @@ except ImportError:
 
 init_session_state()
 
+# 支援的交易所列表
+SUPPORTED_EXCHANGES = {
+    "binance": "幣安 Binance",
+    "bybit": "Bybit",
+    "bitget": "Bitget",
+    "gate": "Gate.io",
+}
+
 
 @st.cache_resource
 def get_backtest_manager():
@@ -125,6 +133,39 @@ def render_date_range():
     return str(start_date), str(end_date)
 
 
+def render_exchange_selector():
+    """渲染交易所選擇器"""
+    st.subheader("🏦 數據來源")
+
+    config = get_config()
+    default_exchange = config.exchange_type
+
+    # 提示說明
+    st.caption("💡 CCXT 下載歷史數據不需要 API Key，可以自由選擇交易所")
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        # 找到預設交易所的索引
+        exchange_keys = list(SUPPORTED_EXCHANGES.keys())
+        default_idx = exchange_keys.index(default_exchange) if default_exchange in exchange_keys else 0
+
+        selected_exchange = st.selectbox(
+            "選擇交易所",
+            options=exchange_keys,
+            format_func=lambda x: SUPPORTED_EXCHANGES[x],
+            index=default_idx,
+            key="backtest_exchange",
+            help="選擇要從哪個交易所下載歷史數據"
+        )
+
+    with col2:
+        # 顯示當前配置的交易所（用於交易）
+        st.caption(f"交易配置: {SUPPORTED_EXCHANGES.get(default_exchange, default_exchange)}")
+
+    return selected_exchange
+
+
 def render_backtest_params(sym_config: SymbolConfig):
     """渲染回測參數"""
     st.subheader("⚙️ 回測參數")
@@ -173,8 +214,12 @@ def render_backtest_params(sym_config: SymbolConfig):
 
 
 def run_single_backtest(manager: BacktestManager, symbol: str, ccxt_symbol: str,
-                        sym_config: SymbolConfig, start_date: str, end_date: str):
+                        sym_config: SymbolConfig, start_date: str, end_date: str,
+                        exchange_type: str = "binance"):
     """執行單筆回測"""
+    # 顯示使用的交易所
+    st.info(f"📡 數據來源: **{SUPPORTED_EXCHANGES.get(exchange_type, exchange_type)}**")
+
     # 檢查並下載數據
     available_dates = manager.get_available_dates(symbol)
 
@@ -190,8 +235,8 @@ def run_single_backtest(manager: BacktestManager, symbol: str, ccxt_symbol: str,
         )
 
         if need_download:
-            st.info("下載歷史數據中...")
-            manager.download_data(symbol, ccxt_symbol, start_date, end_date)
+            st.info(f"從 {exchange_type.upper()} 下載歷史數據中...")
+            manager.download_data(symbol, ccxt_symbol, start_date, end_date, exchange_type)
 
     # 載入數據
     with st.spinner("載入數據..."):
@@ -296,8 +341,12 @@ def render_backtest_result(result: dict):
 def run_optimization(manager: BacktestManager, symbol: str, ccxt_symbol: str,
                      sym_config: SymbolConfig, start_date: str, end_date: str,
                      use_smart: bool = True, n_trials: int = 100,
-                     objective: str = "sharpe", trading_mode=None):
+                     objective: str = "sharpe", trading_mode=None,
+                     exchange_type: str = "binance"):
     """執行參數優化 - 支援智能優化與傳統網格搜索"""
+    # 顯示使用的交易所
+    st.info(f"📡 數據來源: **{SUPPORTED_EXCHANGES.get(exchange_type, exchange_type)}**")
+
     # 載入數據 (與單筆回測相同)
     available_dates = manager.get_available_dates(symbol)
 
@@ -311,8 +360,8 @@ def run_optimization(manager: BacktestManager, symbol: str, ccxt_symbol: str,
     )
 
     if need_download:
-        with st.spinner("下載歷史數據中..."):
-            manager.download_data(symbol, ccxt_symbol, start_date, end_date)
+        with st.spinner(f"從 {exchange_type.upper()} 下載歷史數據中..."):
+            manager.download_data(symbol, ccxt_symbol, start_date, end_date, exchange_type)
 
     with st.spinner("載入數據..."):
         df = manager.load_data(symbol, start_date, end_date)
@@ -1212,6 +1261,9 @@ def main():
         start_date, end_date = render_date_range()
 
         st.divider()
+        selected_exchange = render_exchange_selector()
+
+        st.divider()
         sym_config = render_backtest_params(sym_config)
 
         st.divider()
@@ -1238,6 +1290,7 @@ def main():
             st.session_state.backtest_config = sym_config
             st.session_state.backtest_start = start_date
             st.session_state.backtest_end = end_date
+            st.session_state.backtest_exchange = selected_exchange
             st.session_state.use_smart = use_smart
             st.session_state.n_trials = n_trials
             st.session_state.objective = objective
@@ -1253,10 +1306,12 @@ def main():
             sym_config = st.session_state.backtest_config
             start_date = st.session_state.backtest_start
             end_date = st.session_state.backtest_end
+            exchange_type = st.session_state.get("backtest_exchange", "binance")
 
             if mode == "單筆回測":
                 result = run_single_backtest(
-                    manager, symbol, ccxt_symbol, sym_config, start_date, end_date
+                    manager, symbol, ccxt_symbol, sym_config, start_date, end_date,
+                    exchange_type=exchange_type
                 )
                 if result:
                     render_backtest_result(result)
@@ -1269,7 +1324,7 @@ def main():
                 results, smart_result, optimizer, opt_df = run_optimization(
                     manager, symbol, ccxt_symbol, sym_config, start_date, end_date,
                     use_smart=use_smart, n_trials=n_trials, objective=objective,
-                    trading_mode=trading_mode
+                    trading_mode=trading_mode, exchange_type=exchange_type
                 )
                 if results:
                     # 保存到 session state 供蒙特卡羅模擬使用
