@@ -210,12 +210,13 @@ class BacktestManager:
         leverage = config.leverage
         fee_pct = 0.0004
 
-        last_long_price = df['close'].iloc[0]
-        last_short_price = df['close'].iloc[0]
-
         # 持倉控制參數
         position_threshold = config.position_threshold
         position_limit = config.position_limit
+
+        # 追蹤上次開倉價格 (用於計算止盈價)
+        last_long_entry_price = df['close'].iloc[0]
+        last_short_entry_price = df['close'].iloc[0]
 
         for _, row in df.iterrows():
             price = row['close']
@@ -224,9 +225,10 @@ class BacktestManager:
             long_position = sum(p["qty"] for p in long_positions)
             short_position = sum(p["qty"] for p in short_positions)
 
-            # === 多頭網格 (使用 GridStrategy 統一邏輯) ===
+            # === 同步實盤邏輯：使用當前價格計算網格 ===
+            # 多頭網格
             long_decision = GridStrategy.get_grid_decision(
-                price=last_long_price,
+                price=price,  # 使用當前價格（同步實盤）
                 my_position=long_position,
                 opposite_position=short_position,
                 position_threshold=position_threshold,
@@ -237,56 +239,9 @@ class BacktestManager:
                 side='long'
             )
 
-            sell_price = long_decision['tp_price']
-            long_tp_qty = long_decision['tp_qty']
-            long_dead_mode = long_decision['dead_mode']
-            buy_price = long_decision['entry_price'] if long_decision['entry_price'] else last_long_price * (1 - config.grid_spacing)
-
-            if not long_dead_mode:
-                # 【正常模式】補倉邏輯
-                if price <= buy_price:
-                    qty = order_value / price
-                    margin = (qty * price) / leverage
-                    fee = qty * price * fee_pct
-
-                    if margin + fee < balance:
-                        balance -= (margin + fee)
-                        long_positions.append({"price": price, "qty": qty, "margin": margin})
-                        last_long_price = price
-
-            # 止盈邏輯 (兩種模式都執行)
-            if price >= sell_price and long_positions:
-                # 根據止盈數量決定平倉多少
-                remaining_tp = long_tp_qty
-                while long_positions and remaining_tp > 0:
-                    pos = long_positions[0]
-                    if pos["qty"] <= remaining_tp:
-                        # 全部平倉
-                        long_positions.pop(0)
-                        gross_pnl = (price - pos["price"]) * pos["qty"]
-                        fee = pos["qty"] * price * fee_pct
-                        net_pnl = gross_pnl - fee
-                        balance += pos["margin"] + net_pnl
-                        trades.append({"pnl": net_pnl, "type": "long"})
-                        remaining_tp -= pos["qty"]
-                    else:
-                        # 部分平倉
-                        close_ratio = remaining_tp / pos["qty"]
-                        close_qty = remaining_tp
-                        close_margin = pos["margin"] * close_ratio
-                        gross_pnl = (price - pos["price"]) * close_qty
-                        fee = close_qty * price * fee_pct
-                        net_pnl = gross_pnl - fee
-                        balance += close_margin + net_pnl
-                        trades.append({"pnl": net_pnl, "type": "long"})
-                        pos["qty"] -= close_qty
-                        pos["margin"] -= close_margin
-                        remaining_tp = 0
-                last_long_price = price
-
-            # === 空頭網格 (使用 GridStrategy 統一邏輯) ===
+            # 空頭網格
             short_decision = GridStrategy.get_grid_decision(
-                price=last_short_price,
+                price=price,  # 使用當前價格（同步實盤）
                 my_position=short_position,
                 opposite_position=long_position,
                 position_threshold=position_threshold,
@@ -297,13 +252,57 @@ class BacktestManager:
                 side='short'
             )
 
-            cover_price = short_decision['tp_price']
-            short_tp_qty = short_decision['tp_qty']
+            long_dead_mode = long_decision['dead_mode']
             short_dead_mode = short_decision['dead_mode']
-            sell_short_price = short_decision['entry_price'] if short_decision['entry_price'] else last_short_price * (1 + config.grid_spacing)
 
+            # === 多頭開倉邏輯 ===
+            if not long_dead_mode:
+                buy_price = long_decision['entry_price'] if long_decision['entry_price'] else price * (1 - config.grid_spacing)
+                if price <= buy_price:
+                    qty = order_value / price
+                    margin = (qty * price) / leverage
+                    fee = qty * price * fee_pct
+
+                    if margin + fee < balance:
+                        balance -= (margin + fee)
+                        long_positions.append({"price": price, "qty": qty, "margin": margin})
+                        last_long_entry_price = price
+
+            # === 多頭止盈邏輯 ===
+            if long_positions:
+                # 止盈價格基於最早持倉的開倉價
+                oldest_long_price = long_positions[0]["price"]
+                sell_price = oldest_long_price * (1 + config.take_profit_spacing)
+                long_tp_qty = long_decision['tp_qty']
+
+                if price >= sell_price:
+                    remaining_tp = long_tp_qty
+                    while long_positions and remaining_tp > 0:
+                        pos = long_positions[0]
+                        if pos["qty"] <= remaining_tp:
+                            long_positions.pop(0)
+                            gross_pnl = (price - pos["price"]) * pos["qty"]
+                            fee = pos["qty"] * price * fee_pct
+                            net_pnl = gross_pnl - fee
+                            balance += pos["margin"] + net_pnl
+                            trades.append({"pnl": net_pnl, "type": "long"})
+                            remaining_tp -= pos["qty"]
+                        else:
+                            close_ratio = remaining_tp / pos["qty"]
+                            close_qty = remaining_tp
+                            close_margin = pos["margin"] * close_ratio
+                            gross_pnl = (price - pos["price"]) * close_qty
+                            fee = close_qty * price * fee_pct
+                            net_pnl = gross_pnl - fee
+                            balance += close_margin + net_pnl
+                            trades.append({"pnl": net_pnl, "type": "long"})
+                            pos["qty"] -= close_qty
+                            pos["margin"] -= close_margin
+                            remaining_tp = 0
+
+            # === 空頭開倉邏輯 ===
             if not short_dead_mode:
-                # 【正常模式】補倉邏輯
+                sell_short_price = short_decision['entry_price'] if short_decision['entry_price'] else price * (1 + config.grid_spacing)
                 if price >= sell_short_price:
                     qty = order_value / price
                     margin = (qty * price) / leverage
@@ -312,37 +311,39 @@ class BacktestManager:
                     if margin + fee < balance:
                         balance -= (margin + fee)
                         short_positions.append({"price": price, "qty": qty, "margin": margin})
-                        last_short_price = price
+                        last_short_entry_price = price
 
-            # 止盈邏輯 (兩種模式都執行)
-            if price <= cover_price and short_positions:
-                # 根據止盈數量決定平倉多少
-                remaining_tp = short_tp_qty
-                while short_positions and remaining_tp > 0:
-                    pos = short_positions[0]
-                    if pos["qty"] <= remaining_tp:
-                        # 全部平倉
-                        short_positions.pop(0)
-                        gross_pnl = (pos["price"] - price) * pos["qty"]
-                        fee = pos["qty"] * price * fee_pct
-                        net_pnl = gross_pnl - fee
-                        balance += pos["margin"] + net_pnl
-                        trades.append({"pnl": net_pnl, "type": "short"})
-                        remaining_tp -= pos["qty"]
-                    else:
-                        # 部分平倉
-                        close_ratio = remaining_tp / pos["qty"]
-                        close_qty = remaining_tp
-                        close_margin = pos["margin"] * close_ratio
-                        gross_pnl = (pos["price"] - price) * close_qty
-                        fee = close_qty * price * fee_pct
-                        net_pnl = gross_pnl - fee
-                        balance += close_margin + net_pnl
-                        trades.append({"pnl": net_pnl, "type": "short"})
-                        pos["qty"] -= close_qty
-                        pos["margin"] -= close_margin
-                        remaining_tp = 0
-                last_short_price = price
+            # === 空頭止盈邏輯 ===
+            if short_positions:
+                # 止盈價格基於最早持倉的開倉價
+                oldest_short_price = short_positions[0]["price"]
+                cover_price = oldest_short_price * (1 - config.take_profit_spacing)
+                short_tp_qty = short_decision['tp_qty']
+
+                if price <= cover_price:
+                    remaining_tp = short_tp_qty
+                    while short_positions and remaining_tp > 0:
+                        pos = short_positions[0]
+                        if pos["qty"] <= remaining_tp:
+                            short_positions.pop(0)
+                            gross_pnl = (pos["price"] - price) * pos["qty"]
+                            fee = pos["qty"] * price * fee_pct
+                            net_pnl = gross_pnl - fee
+                            balance += pos["margin"] + net_pnl
+                            trades.append({"pnl": net_pnl, "type": "short"})
+                            remaining_tp -= pos["qty"]
+                        else:
+                            close_ratio = remaining_tp / pos["qty"]
+                            close_qty = remaining_tp
+                            close_margin = pos["margin"] * close_ratio
+                            gross_pnl = (pos["price"] - price) * close_qty
+                            fee = close_qty * price * fee_pct
+                            net_pnl = gross_pnl - fee
+                            balance += close_margin + net_pnl
+                            trades.append({"pnl": net_pnl, "type": "short"})
+                            pos["qty"] -= close_qty
+                            pos["margin"] -= close_margin
+                            remaining_tp = 0
 
             # 計算淨值
             unrealized = sum((price - p["price"]) * p["qty"] for p in long_positions)
