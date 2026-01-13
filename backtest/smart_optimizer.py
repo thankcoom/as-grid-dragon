@@ -114,7 +114,8 @@ class SmartOptimizationResult:
             f"\n最佳參數:\n"
             f"  止盈間距: {self.best_params.get('take_profit_spacing', 0)*100:.3f}%\n"
             f"  補倉間距: {self.best_params.get('grid_spacing', 0)*100:.3f}%\n"
-            f"  槓桿: {self.best_params.get('leverage', 20)}x\n"
+            f"  止盈加倍倍數: {self.best_params.get('limit_multiplier', 5.0):.1f}x\n"
+            f"  裝死模式倍數: {self.best_params.get('threshold_multiplier', 14.0):.1f}x\n"
             f"\n最佳績效:\n"
             f"  目標值: {self.best_objective:.4f}\n"
             f"  收益率: {self.best_metrics.get('return_pct', 0)*100:.2f}%\n"
@@ -145,15 +146,15 @@ class SmartOptimizer:
 
     # 參數邊界定義
     DEFAULT_PARAM_BOUNDS = {
-        "take_profit_spacing": (0.001, 0.015),  # 0.1% ~ 1.5%
-        "grid_spacing": (0.002, 0.025),          # 0.2% ~ 2.5%
-        "leverage": (5, 50),                      # 5x ~ 50x
+        "take_profit_spacing": (0.001, 0.015),   # 0.1% ~ 1.5%
+        "grid_spacing": (0.002, 0.025),           # 0.2% ~ 2.5%
+        "limit_multiplier": (2.0, 10.0),          # 止盈加倍倍數 2x ~ 10x
+        "threshold_multiplier": (6.0, 20.0),      # 裝死模式倍數 6x ~ 20x
     }
 
     # 固定參數 (不優化)
     DEFAULT_FIXED_PARAMS = {
-        "position_threshold": 500.0,
-        "position_limit": 100.0,
+        "leverage": 20,           # 槓桿固定
         "max_positions": 50,
         "max_drawdown": 0.5,
         "fee_pct": 0.0004,
@@ -191,19 +192,38 @@ class SmartOptimizer:
 
     def _create_config(self, params: Dict) -> Config:
         """根據參數創建配置"""
+        # 獲取 multiplier 參數
+        limit_mult = params.get('limit_multiplier', self.base_config.limit_multiplier)
+        threshold_mult = params.get('threshold_multiplier', self.base_config.threshold_multiplier)
+
+        # 計算 position_limit 和 position_threshold
+        # 這裡使用 initial_quantity 來計算，如果未設置則使用預設值
+        initial_qty = self.base_config.initial_quantity
+        if initial_qty <= 0:
+            # 如果沒有設置 initial_quantity，使用 order_value / 估計價格
+            # 這裡使用 df 的中間價格估計
+            mid_price = self.df['close'].median() if len(self.df) > 0 else 1.0
+            initial_qty = self.base_config.order_value / mid_price
+
+        position_limit = initial_qty * limit_mult
+        position_threshold = initial_qty * threshold_mult
+
         return Config(
             symbol=self.base_config.symbol,
             initial_balance=self.base_config.initial_balance,
             order_value=self.base_config.order_value,
-            leverage=int(params.get('leverage', self.base_config.leverage)),
+            initial_quantity=self.base_config.initial_quantity,
+            leverage=int(self.fixed_params.get('leverage', self.base_config.leverage)),
             take_profit_spacing=params.get('take_profit_spacing', self.base_config.take_profit_spacing),
             grid_spacing=params.get('grid_spacing', self.base_config.grid_spacing),
             direction=self.base_config.direction,
             max_drawdown=self.fixed_params.get('max_drawdown', 0.5),
             max_positions=self.fixed_params.get('max_positions', 50),
             fee_pct=self.fixed_params.get('fee_pct', 0.0004),
-            position_threshold=self.fixed_params.get('position_threshold', 500.0),
-            position_limit=self.fixed_params.get('position_limit', 100.0),
+            position_threshold=position_threshold,
+            position_limit=position_limit,
+            limit_multiplier=limit_mult,
+            threshold_multiplier=threshold_mult,
         )
 
     def _run_backtest(self, params: Dict) -> BacktestResult:
@@ -312,12 +332,28 @@ class SmartOptimizer:
             'grid_spacing', gs_lower, gs_max, log=True
         )
 
-        # 槓桿
-        if 'leverage' in self.param_bounds:
-            lev_min, lev_max = self.param_bounds['leverage']
-            params['leverage'] = trial.suggest_int('leverage', int(lev_min), int(lev_max))
+        # 止盈加倍倍數 (limit_multiplier)
+        if 'limit_multiplier' in self.param_bounds:
+            lm_min, lm_max = self.param_bounds['limit_multiplier']
+            params['limit_multiplier'] = trial.suggest_float(
+                'limit_multiplier', lm_min, lm_max
+            )
         else:
-            params['leverage'] = self.base_config.leverage
+            params['limit_multiplier'] = self.base_config.limit_multiplier
+
+        # 裝死模式倍數 (threshold_multiplier)
+        # 確保 threshold_multiplier > limit_multiplier (裝死閾值應大於加倍閾值)
+        if 'threshold_multiplier' in self.param_bounds:
+            tm_min, tm_max = self.param_bounds['threshold_multiplier']
+            # 動態下限：至少比 limit_multiplier 大 1.5 倍
+            tm_lower = max(tm_min, params['limit_multiplier'] * 1.5)
+            if tm_lower >= tm_max:
+                tm_lower = tm_min  # 如果下限超過上限，回退到原始下限
+            params['threshold_multiplier'] = trial.suggest_float(
+                'threshold_multiplier', tm_lower, tm_max
+            )
+        else:
+            params['threshold_multiplier'] = self.base_config.threshold_multiplier
 
         # 執行回測
         try:
@@ -378,9 +414,22 @@ class SmartOptimizer:
             'grid_spacing', gs_lower, gs_max, log=True
         )
 
-        if 'leverage' in self.param_bounds:
-            lev_min, lev_max = self.param_bounds['leverage']
-            params['leverage'] = trial.suggest_int('leverage', int(lev_min), int(lev_max))
+        # 止盈加倍倍數 (limit_multiplier)
+        if 'limit_multiplier' in self.param_bounds:
+            lm_min, lm_max = self.param_bounds['limit_multiplier']
+            params['limit_multiplier'] = trial.suggest_float(
+                'limit_multiplier', lm_min, lm_max
+            )
+
+        # 裝死模式倍數 (threshold_multiplier)
+        if 'threshold_multiplier' in self.param_bounds:
+            tm_min, tm_max = self.param_bounds['threshold_multiplier']
+            tm_lower = max(tm_min, params.get('limit_multiplier', 5.0) * 1.5)
+            if tm_lower >= tm_max:
+                tm_lower = tm_min
+            params['threshold_multiplier'] = trial.suggest_float(
+                'threshold_multiplier', tm_lower, tm_max
+            )
 
         try:
             result = self._run_backtest(params)
@@ -580,7 +629,7 @@ class SmartOptimizer:
         df = pd.DataFrame([t.to_dict() for t in self._trials])
         importance = {}
 
-        for param in ['take_profit_spacing', 'grid_spacing', 'leverage']:
+        for param in ['take_profit_spacing', 'grid_spacing', 'limit_multiplier', 'threshold_multiplier']:
             col = f'param_{param}'
             if col in df.columns:
                 # 計算參數值與目標值的相關性

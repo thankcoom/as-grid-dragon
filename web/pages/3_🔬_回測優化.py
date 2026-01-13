@@ -389,7 +389,8 @@ def run_smart_optimization(df: pd.DataFrame, sym_config: SymbolConfig,
         results.append({
             "take_profit_spacing": trial.params.get("take_profit_spacing", sym_config.take_profit_spacing),
             "grid_spacing": trial.params.get("grid_spacing", sym_config.grid_spacing),
-            "leverage": trial.params.get("leverage", sym_config.leverage),
+            "limit_multiplier": trial.params.get("limit_multiplier", 5.0),
+            "threshold_multiplier": trial.params.get("threshold_multiplier", 14.0),
             "return_pct": trial.metrics.get("return_pct", 0),
             "max_drawdown": trial.metrics.get("max_drawdown", 0),
             "win_rate": trial.metrics.get("win_rate", 0),
@@ -442,9 +443,11 @@ def render_optimization_results(results: list, symbol: str, smart_result=None, o
         # 智能優化額外顯示 Sharpe
         if "sharpe_ratio" in r and r["sharpe_ratio"]:
             row["Sharpe"] = f"{r['sharpe_ratio']:.2f}"
-        # 顯示槓桿（如果被優化）
-        if "leverage" in r:
-            row["槓桿"] = r["leverage"]
+        # 顯示新參數（如果被優化）
+        if "limit_multiplier" in r:
+            row["加倍倍數"] = f"{r['limit_multiplier']:.1f}"
+        if "threshold_multiplier" in r:
+            row["裝死倍數"] = f"{r['threshold_multiplier']:.1f}"
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -479,8 +482,10 @@ def render_optimization_results(results: list, symbol: str, smart_result=None, o
 
         with col1:
             params_str = f"**最佳參數:** 止盈 {best['take_profit_spacing']*100:.2f}%, 補倉 {best['grid_spacing']*100:.2f}%"
-            if "leverage" in best:
-                params_str += f", 槓桿 {best['leverage']}x"
+            if "limit_multiplier" in best:
+                params_str += f", 加倍 {best['limit_multiplier']:.1f}x"
+            if "threshold_multiplier" in best:
+                params_str += f", 裝死 {best['threshold_multiplier']:.1f}x"
             st.markdown(params_str)
 
         with col2:
@@ -492,8 +497,10 @@ def render_optimization_results(results: list, symbol: str, smart_result=None, o
 
                 config.symbols[symbol].take_profit_spacing = best['take_profit_spacing']
                 config.symbols[symbol].grid_spacing = best['grid_spacing']
-                if "leverage" in best:
-                    config.symbols[symbol].leverage = best['leverage']
+                if "limit_multiplier" in best:
+                    config.symbols[symbol].limit_multiplier = best['limit_multiplier']
+                if "threshold_multiplier" in best:
+                    config.symbols[symbol].threshold_multiplier = best['threshold_multiplier']
                 save_config()
 
                 st.success("已套用最佳參數!")
@@ -741,10 +748,10 @@ def render_parallel_coordinate(study, smart_result):
     """渲染平行座標圖"""
     import plotly.express as px
     import pandas as pd
-    
+
     st.markdown("**平行座標圖**")
     st.caption("同時顯示所有參數與目標值的關係。追蹤高目標值的線條可以看出參數偏好。")
-    
+
     try:
         # 從試驗中提取數據
         data = []
@@ -753,38 +760,40 @@ def render_parallel_coordinate(study, smart_result):
                 row = {
                     "止盈%": trial.params.get("take_profit_spacing", 0) * 100,
                     "補倉%": trial.params.get("grid_spacing", 0) * 100,
-                    "槓桿": trial.params.get("leverage", 20),
+                    "加倍倍數": trial.params.get("limit_multiplier", 5.0),
+                    "裝死倍數": trial.params.get("threshold_multiplier", 14.0),
                     "目標值": trial.value
                 }
                 data.append(row)
-        
+
         if len(data) < 5:
             st.info("試驗數據不足，無法生成平行座標圖")
             return
-        
+
         df = pd.DataFrame(data)
-        
+
         # 創建平行座標圖
         fig = px.parallel_coordinates(
             df,
-            dimensions=["止盈%", "補倉%", "槓桿", "目標值"],
+            dimensions=["止盈%", "補倉%", "加倍倍數", "裝死倍數", "目標值"],
             color="目標值",
             color_continuous_scale="RdYlGn",
             labels={"color": "目標值"}
         )
-        
+
         fig.update_layout(
             height=400,
             margin=dict(l=50, r=50, t=30, b=30),
         )
-        
+
         st.plotly_chart(fig, use_container_width=True)
-        
+
         # 參數相關性提示
         st.markdown("""
         **解讀提示**：
         - 觀察顏色較深（目標值高）的線條集中在哪個區間
-        - 如果線條在某個參數軸上分散，表示該參數影響較小
+        - **加倍倍數**: 觸發止盈加倍的倉位閾值倍數（越小越早加倍出貨）
+        - **裝死倍數**: 觸發裝死模式的倉位閾值倍數（越小越早停止補倉）
         - 線條交叉較多的區域表示參數之間存在交互作用
         """)
         
@@ -858,14 +867,31 @@ def run_monte_carlo(smart_result, df, sym_config, n_simulations, window_pct):
     import numpy as np
     from backtest.backtester import Backtester
     from backtest.config import Config as BacktestConfig
-    
+
+    # 獲取優化後的 multiplier 參數
+    limit_mult = smart_result.best_params.get("limit_multiplier", 5.0)
+    threshold_mult = smart_result.best_params.get("threshold_multiplier", 14.0)
+
+    # 計算 position_limit 和 position_threshold
+    initial_qty = sym_config.initial_quantity
+    if initial_qty <= 0:
+        mid_price = df['close'].median() if len(df) > 0 else 1.0
+        initial_qty = 10.0 / mid_price  # 預設 10 USDT
+
+    position_limit = initial_qty * limit_mult
+    position_threshold = initial_qty * threshold_mult
+
     # 準備最佳參數配置
     best_config = BacktestConfig(
         symbol=sym_config.symbol,
         initial_quantity=sym_config.initial_quantity,
-        leverage=int(smart_result.best_params.get("leverage", sym_config.leverage)),
+        leverage=sym_config.leverage,  # 槓桿使用原始設定
         take_profit_spacing=smart_result.best_params.get("take_profit_spacing", sym_config.take_profit_spacing),
         grid_spacing=smart_result.best_params.get("grid_spacing", sym_config.grid_spacing),
+        limit_multiplier=limit_mult,
+        threshold_multiplier=threshold_mult,
+        position_limit=position_limit,
+        position_threshold=position_threshold,
     )
     
     # 計算窗口大小
