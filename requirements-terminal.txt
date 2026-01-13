@@ -1,0 +1,6 @@
+rich
+ccxt
+websockets
+pandas
+numpy
+certifi

@@ -398,35 +398,37 @@ class BinanceAdapter(ExchangeAdapter):
     ) -> str:
         """
         建構完整的 WebSocket 訂閱 URL
-
+        
         Args:
             symbols: 要訂閱的交易對列表 (原始格式, e.g., ["XRPUSDC"])
             user_stream_key: Listen Key
 
         Returns:
-            完整 URL, e.g.,
-            wss://fstream.binance.com/ws/stream?streams=xrpusdc@ticker/listenKey
+            完整 URL, e.g., 
+            wss://fstream.binance.com/stream?streams=xrpusdc@bookTicker/listenKey
         """
         streams = []
 
-        # 添加 ticker 訂閱
+        # 添加 ticker 訂閱 (改用 bookTicker 以獲得更即時的價格)
         for symbol in symbols:
             ws_sym = self.convert_symbol_to_ws(symbol)
-            streams.append(f"{ws_sym}@ticker")
+            streams.append(f"{ws_sym}@bookTicker")
 
         # 添加用戶數據流
         if user_stream_key:
             streams.append(user_stream_key)
 
         base_url = self.get_websocket_url()
-        return f"{base_url}/stream?streams=" + "/".join(streams)
+        # 修復: 使用正確的參數格式，多個streams用/連接
+        stream_param = "/".join(streams)
+        return f"{base_url}/stream?streams={stream_param}"
 
     def parse_ws_message(self, raw_message: str) -> Optional[WSMessage]:
         """
         解析 WebSocket 原始消息
 
         Binance 消息格式:
-            Combined Stream: {"stream": "xrpusdc@ticker", "data": {...}}
+            Combined Stream: {"stream": "xrpusdc@bookTicker", "data": {...}}
             Direct Ticker: {"e": "24hrTicker", "s": "XRPUSDC", "c": "0.54", ...}
             User Data: {"e": "ORDER_TRADE_UPDATE", ...}
         """
@@ -438,8 +440,8 @@ class BinanceAdapter(ExchangeAdapter):
                 stream = data["stream"]
                 payload = data["data"]
 
-                # Ticker 更新
-                if "@ticker" in stream:
+                # Ticker 更新 (bookTicker 或 ticker)
+                if "@bookTicker" in stream or "@ticker" in stream:
                     ticker = self._parse_ticker(payload)
                     if ticker:
                         return WSMessage(
@@ -456,8 +458,18 @@ class BinanceAdapter(ExchangeAdapter):
             elif "e" in data:
                 event_type = data.get("e")
                 
+                # bookTicker 事件
+                if event_type == "bookTicker":
+                    ticker = self._parse_ticker(data)
+                    if ticker:
+                        return WSMessage(
+                            msg_type=WSMessageType.TICKER,
+                            symbol=ticker.symbol,
+                            data=ticker
+                        )
+
                 # 24hr Ticker 事件 (直接格式)
-                if event_type == "24hrTicker":
+                elif event_type == "24hrTicker":
                     ticker = self._parse_ticker(data)
                     if ticker:
                         return WSMessage(
@@ -483,24 +495,54 @@ class BinanceAdapter(ExchangeAdapter):
     def _parse_ticker(self, data: dict) -> Optional[TickerUpdate]:
         """
         解析 Binance ticker 消息
+        支援 24hrTicker 和 bookTicker 格式
 
-        格式: {
-            "s": "XRPUSDC",  // Symbol
-            "c": "0.5432",   // Close price
-            "b": "0.5431",   // Best bid
-            "a": "0.5433",   // Best ask
-            "E": 1234567890  // Event time
+        24hrTicker 格式: {
+            "s": "XRPUSDC", "c": "0.5432", "b": "0.5431", "a": "0.5433", "E": 1234567890
+        }
+        bookTicker 格式: {
+            "s": "BTCUSDT", "b": "40000.01", "B": "1.5", "a": "40000.02", "A": "1.2", "u": 123..., "T": 123...
         }
         """
         try:
+            symbol_raw = data.get("s", "")
+            if not symbol_raw:
+                # 對於 Combined Stream 格式，symbol 可能在外層
+                # 例如: {"stream": "xrpusdc@bookTicker", "data": {"s": "XRPUSDC", "b": "...", "a": "..."}}
+                # 但在這裡 data 是解析後的內層數據，所以應當包含 's'
+                return None
+                
+            bid = float(data.get("b", 0))
+            ask = float(data.get("a", 0))
+            
+            # 從 'c' (Close) 獲取價格，若無(bookTicker)則計算中間價
+            price = float(data.get("c", 0))
+            if price == 0 and bid > 0 and ask > 0:
+                price = (bid + ask) / 2
+            elif price == 0 and bid > 0:
+                # 如果只有bid可用，使用bid
+                price = bid
+            elif price == 0 and ask > 0:
+                # 如果只有ask可用，使用ask
+                price = ask
+                
+            # timestamp: 24hrTicker 用 E, bookTicker 用 T (transaction time) 或 E (event time)
+            timestamp = float(data.get("E", 0) or data.get("T", 0) or time.time()*1000) / 1000
+            
+            # 確保價格有效
+            if price <= 0:
+                return None
+            
             return TickerUpdate(
-                symbol=self.convert_symbol_to_ccxt(data.get("s", "")),
-                price=float(data.get("c", 0)),
-                bid=float(data.get("b", 0)),
-                ask=float(data.get("a", 0)),
-                timestamp=float(data.get("E", 0)) / 1000,
+                symbol=self.convert_symbol_to_ccxt(symbol_raw),
+                price=price,
+                bid=bid,
+                ask=ask,
+                timestamp=timestamp,
             )
-        except Exception:
+        except Exception as e:
+            # 添加錯誤日誌以便調試
+            logger.debug(f"[Binance] 解析Ticker消息失敗: {e}, data: {data}")
             return None
 
     def _parse_user_data(self, data: dict) -> Optional[WSMessage]:

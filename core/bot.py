@@ -369,7 +369,7 @@ class MaxGridBot:
         logger.info("[Bot] 配置已重新載入")
 
     async def _websocket_loop(self):
-        """WebSocket 主循環 (使用 Adapter 構建 URL)"""
+        """WebSocket 主循環 (使用 Adapter 構建 URL) - 參考 as_terminal_max.py 邏輯優化"""
         # 收集啟用的交易對
         symbols = []
         for sym_cfg in self.config.symbols.values():
@@ -394,8 +394,8 @@ class MaxGridBot:
                 url = self.adapter.build_stream_url(symbols, self.listen_key)
 
                 print(f"[Bot] 正在連接 WebSocket: {url[:80]}...")
-                async with websockets.connect(url, ssl=ssl_context, ping_interval=30, ping_timeout=10) as ws:
-                    self.ws = ws
+                # 參考 as_terminal_max.py: 移除 ping_interval, 使用手動 ping
+                async with websockets.connect(url, ssl=ssl_context) as ws:
                     self.ws = ws
                     self.state.connected = True
                     print(f"[Bot] WebSocket 已連接 ({self.adapter.get_display_name()})")
@@ -406,26 +406,44 @@ class MaxGridBot:
                         await ws.send(self.listen_key)
                         await asyncio.sleep(1.0)  # 等待認證成功
 
-                    # 發送訂閱請求 (Bitget, Gate, Bybit 需要)
-                    sub_msg = self.adapter.get_subscription_message(symbols)
-                    if sub_msg:
-                        # 為了某些交易所 (如 Bitget) 需要一些延遲或特定格式，這裡直接發送
-                        print(f"[Bot] 發送訂閱請求...")
-                        await ws.send(json.dumps(sub_msg))
+                    # 對於 Binance，訂閱請求已經在 URL 中完成 (Combined Stream)
+                    # 只有其他交易所需要額外發送訂閱消息
+                    if self.adapter.get_exchange_name() != 'binance':
+                        # 檢查 adapter 是否有 get_subscription_message 方法
+                        if hasattr(self.adapter, 'get_subscription_message'):
+                            sub_msg = self.adapter.get_subscription_message(symbols)
+                            if sub_msg:
+                                print(f"[Bot] 發送訂閱請求: {str(sub_msg)[:100]}...")
+                                # 修正: 如果 sub_msg 已經是字串 (JSON)，直接發送，避免 double encoding
+                                if isinstance(sub_msg, str):
+                                    await ws.send(sub_msg)
+                                else:
+                                    await ws.send(json.dumps(sub_msg))
 
-                    asyncio.create_task(self._sync_loop())
-                    msg_count = 0
-                    async for message in ws:
-                        if self._stop_event.is_set():
-                            break
-                        msg_count += 1
-                        await self._handle_message(message)
-            except websockets.exceptions.ConnectionClosed:
-                logger.warning("[Bot] WebSocket 連接關閉，重連中...")
+                    # 啟動同步循環
+                    sync_task = asyncio.create_task(self._sync_loop())
+                    
+                    try:
+                        while not self._stop_event.is_set():
+                            try:
+                                # 參考 as_terminal_max.py: 使用 wait_for + 手動 ping
+                                msg = await asyncio.wait_for(ws.recv(), timeout=30)
+                                await self._handle_message(msg)
+                            except asyncio.TimeoutError:
+                                # 超時發送 ping
+                                await ws.ping()
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.warning("[Bot] WebSocket 連接關閉")
+                    finally:
+                        sync_task.cancel()
+
             except Exception as e:
                 logger.error(f"[Bot] WebSocket 錯誤: {e}")
+                
             self.state.connected = False
-            await asyncio.sleep(5)
+            if not self._stop_event.is_set():
+                print("[Bot] WebSocket 斷開，5秒後重連...")
+                await asyncio.sleep(5)
 
     async def _sync_loop(self):
         """定期同步循環 (與 Terminal 版 sync_all 一致)"""
@@ -444,17 +462,23 @@ class MaxGridBot:
         try:
             ws_msg = self.adapter.parse_ws_message(message)
             if not ws_msg:
+                # 添加調試日誌，檢查解析失敗的消息
+                logger.debug(f"[WebSocket] 無法解析消息: {message[:200]}")
                 return
 
             if ws_msg.msg_type == WSMessageType.TICKER:
+                logger.debug(f"[WebSocket] 收到Ticker消息: {ws_msg.symbol}, 價格={getattr(ws_msg.data, 'price', 'N/A')}")
                 await self._handle_ticker_update(ws_msg.symbol, ws_msg.data)
             elif ws_msg.msg_type == WSMessageType.ORDER_UPDATE:
+                logger.debug(f"[WebSocket] 收到訂單消息: {ws_msg.symbol}, 狀態={getattr(ws_msg.data, 'status', 'N/A')}")
                 await self._handle_order_update(ws_msg.data)
             elif ws_msg.msg_type == WSMessageType.ACCOUNT_UPDATE:
+                logger.debug(f"[WebSocket] 收到账戶消息: 更新持倉和餘額")
                 await self._handle_account_update(ws_msg.data)
 
         except Exception as e:
             logger.error(f"處理訊息錯誤: {e}")
+            logger.debug(f"錯誤消息內容: {message[:500]}")
 
     async def _handle_order_update(self, order_update):
         """
@@ -565,40 +589,83 @@ class MaxGridBot:
             raw_symbol: 原始交易對符號 (如 XRPUSDC 或 XRP_USDT)
             ticker_update: exchanges.base.TickerUpdate 實例
         """
-        # 標準化 symbol 進行比對
-        normalized_raw = normalize_symbol(raw_symbol)[0]
+        # 改進符號匹配邏輯 - 先嘗試直接匹配，再標準化匹配
         matched = False
+        matched_cfg = None
+        
+        # 1. 首先嘗試原始符號直接匹配 (對應 ccxt_symbol)
         for cfg in self.config.symbols.values():
-            cfg_normalized = normalize_symbol(cfg.symbol)[0]
-            
-            if cfg_normalized == normalized_raw and cfg.ccxt_symbol in self.state.symbols:
+            if not cfg.enabled:
+                continue
+            # 檢查原始符號是否與 ccxt_symbol 匹配
+            if raw_symbol == cfg.ccxt_symbol and cfg.ccxt_symbol in self.state.symbols:
+                matched_cfg = cfg
                 matched = True
-                sym_state = self.state.symbols[cfg.ccxt_symbol]
-                
-                # 更新價格信息
-                old_price = sym_state.latest_price
-                sym_state.latest_price = ticker_update.price
-                sym_state.best_bid = ticker_update.bid
-                sym_state.best_ask = ticker_update.ask
-
-
-                # 更新領先指標
-                self.leading_indicator.update_spread(cfg.ccxt_symbol, sym_state.best_bid, sym_state.best_ask)
-                self.dynamic_grid.update_price(cfg.ccxt_symbol, sym_state.latest_price)
-
-                if self.config.bandit.contextual_enabled:
-                    self.bandit_optimizer.update_price(sym_state.latest_price)
-
-                # 總是嘗試執行網格交易，而不僅僅是間隔控制
-                # 這樣可以確保價格變化時立即響應
-                await self._place_grid(cfg)
-                
-                # 如果價格變動較大，也更新時間戳以避免過於頻繁的網格操作
-                now = time.time()
-                last = self.last_grid_time.get(cfg.ccxt_symbol, 0)
-                if now - last >= self.grid_interval:
-                    self.last_grid_time[cfg.ccxt_symbol] = now
                 break
+        
+        # 2. 如果沒有直接匹配，嘗試標準化匹配
+        if not matched:
+            normalized_raw = normalize_symbol(raw_symbol)[0]
+            for cfg in self.config.symbols.values():
+                if not cfg.enabled:
+                    continue
+                cfg_normalized = normalize_symbol(cfg.symbol)[0]
+                
+                if cfg_normalized == normalized_raw and cfg.ccxt_symbol in self.state.symbols:
+                    matched_cfg = cfg
+                    matched = True
+                    break
+        
+        # 3. 如果還是沒有匹配，嘗試適配器的符號轉換
+        if not matched:
+            for cfg in self.config.symbols.values():
+                if not cfg.enabled:
+                    continue
+                # 使用適配器轉換原始符號到WS格式，再反向匹配
+                try:
+                    ws_symbol = self.adapter.convert_symbol_to_ws(cfg.symbol)
+                    if raw_symbol.upper() == ws_symbol.upper():
+                        matched_cfg = cfg
+                        matched = True
+                        break
+                    # 或者嘗試將WS格式轉換回CCXT格式
+                    ccxt_from_ws = self.adapter.convert_symbol_to_ccxt(raw_symbol)
+                    if ccxt_from_ws == cfg.ccxt_symbol:
+                        matched_cfg = cfg
+                        matched = True
+                        break
+                except Exception:
+                    continue
+        
+        if matched and matched_cfg:
+            sym_state = self.state.symbols[matched_cfg.ccxt_symbol]
+            
+            # 更新價格信息
+            old_price = sym_state.latest_price
+            sym_state.latest_price = ticker_update.price
+            sym_state.best_bid = ticker_update.bid
+            sym_state.best_ask = ticker_update.ask
+
+            # 添加調試日誌
+            if old_price != sym_state.latest_price:
+                logger.debug(f"[Ticker] {matched_cfg.symbol} 價格更新: {old_price} -> {sym_state.latest_price}")
+
+            # 更新領先指標
+            self.leading_indicator.update_spread(matched_cfg.ccxt_symbol, sym_state.best_bid, sym_state.best_ask)
+            self.dynamic_grid.update_price(matched_cfg.ccxt_symbol, sym_state.latest_price)
+
+            if self.config.bandit.contextual_enabled:
+                self.bandit_optimizer.update_price(sym_state.latest_price)
+
+            # 總是嘗試執行網格交易，而不僅僅是間隔控制
+            # 這樣可以確保價格變化時立即響應
+            await self._place_grid(matched_cfg)
+            
+            # 如果價格變動較大，也更新時間戳以避免過於頻繁的網格操作
+            now = time.time()
+            last = self.last_grid_time.get(matched_cfg.ccxt_symbol, 0)
+            if now - last >= self.grid_interval:
+                self.last_grid_time[matched_cfg.ccxt_symbol] = now
 
 
     async def _place_grid(self, cfg):
