@@ -273,11 +273,8 @@ class BybitAdapter(ExchangeAdapter):
         position_side: str = "BOTH",
         reduce_only: bool = False
     ) -> Dict:
-        """創建限價單"""
-        params = {}
-
-        if reduce_only:
-            params["reduceOnly"] = True
+        """創建限價單 (與終端版一致)"""
+        params = {'reduce_only': reduce_only}
 
         # Bybit 使用 positionIdx 而非 positionSide
         # 0 = one-way mode, 1 = hedge-long, 2 = hedge-short
@@ -308,11 +305,8 @@ class BybitAdapter(ExchangeAdapter):
         position_side: str = "BOTH",
         reduce_only: bool = False
     ) -> Dict:
-        """創建市價單"""
-        params = {}
-
-        if reduce_only:
-            params["reduceOnly"] = True
+        """創建市價單 (與終端版一致)"""
+        params = {'reduce_only': reduce_only}
 
         if position_side == "LONG":
             params["positionIdx"] = 1

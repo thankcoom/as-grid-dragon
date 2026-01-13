@@ -284,11 +284,8 @@ class BitgetAdapter(ExchangeAdapter):
         position_side: str = "BOTH",
         reduce_only: bool = False
     ) -> Dict:
-        """創建限價單"""
-        params = {}
-
-        if reduce_only:
-            params["reduceOnly"] = True
+        """創建限價單 (與終端版一致)"""
+        params = {'reduce_only': reduce_only}
 
         # Bitget 使用 holdSide
         if position_side == "LONG":
@@ -316,11 +313,8 @@ class BitgetAdapter(ExchangeAdapter):
         position_side: str = "BOTH",
         reduce_only: bool = False
     ) -> Dict:
-        """創建市價單"""
-        params = {}
-
-        if reduce_only:
-            params["reduceOnly"] = True
+        """創建市價單 (與終端版一致)"""
+        params = {'reduce_only': reduce_only}
 
         if position_side == "LONG":
             params["holdSide"] = "long"

@@ -282,7 +282,7 @@ class GateAdapter(ExchangeAdapter):
         reduce_only: bool = False
     ) -> Dict:
         """
-        創建限價單
+        創建限價單 (與終端版一致)
 
         Gate.io 合約使用 size 正負號表示方向:
         - 正數 = 做多 (long)
@@ -294,7 +294,7 @@ class GateAdapter(ExchangeAdapter):
         - 開空: side=sell, size=負數
         - 平空: side=buy, size=負數, close=True
         """
-        params = {"settle": "usdt"}
+        params = {"settle": "usdt", 'reduce_only': reduce_only}
 
         # Gate.io 使用 size 正負號處理方向
         # 當 position_side 為 SHORT 時，amount 需要為負數
@@ -305,7 +305,6 @@ class GateAdapter(ExchangeAdapter):
             actual_amount = abs(amount)
 
         if reduce_only:
-            params["reduceOnly"] = True
             params["close"] = True
 
         order = self.exchange.create_order(
@@ -328,8 +327,8 @@ class GateAdapter(ExchangeAdapter):
         position_side: str = "BOTH",
         reduce_only: bool = False
     ) -> Dict:
-        """創建市價單 (處理 position_side)"""
-        params = {"settle": "usdt"}
+        """創建市價單 (與終端版一致)"""
+        params = {"settle": "usdt", 'reduce_only': reduce_only}
 
         # Gate.io 使用 size 正負號處理方向
         actual_amount = amount
@@ -339,7 +338,6 @@ class GateAdapter(ExchangeAdapter):
             actual_amount = abs(amount)
 
         if reduce_only:
-            params["reduceOnly"] = True
             params["close"] = True
 
         order = self.exchange.create_order(
