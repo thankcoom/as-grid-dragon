@@ -1222,6 +1222,19 @@ def main():
                     )
 
             st.session_state.run_backtest = False
+        elif st.session_state.get("opt_results") is not None:
+            # 已有優化結果，從 session state 恢復顯示
+            results = st.session_state.opt_results
+            symbol = st.session_state.opt_symbol
+            smart_result = st.session_state.opt_smart_result
+            optimizer = st.session_state.opt_optimizer
+            opt_df = st.session_state.opt_df
+            sym_config = st.session_state.opt_sym_config
+            
+            render_optimization_results(
+                results, symbol, smart_result, optimizer,
+                df=opt_df, sym_config=sym_config
+            )
         else:
             st.info("配置參數後點擊「開始」執行回測")
 
