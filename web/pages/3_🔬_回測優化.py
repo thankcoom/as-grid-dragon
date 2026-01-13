@@ -865,7 +865,7 @@ def render_monte_carlo_simulation(smart_result, df=None, sym_config=None):
 def run_monte_carlo(smart_result, df, sym_config, n_simulations, window_pct):
     """執行蒙特卡羅模擬，返回結果列表"""
     import numpy as np
-    from backtest.backtester import Backtester
+    from backtest.backtester import GridBacktester
     from backtest.config import Config as BacktestConfig
 
     # 獲取優化後的 multiplier 參數
@@ -908,8 +908,7 @@ def run_monte_carlo(smart_result, df, sym_config, n_simulations, window_pct):
     
     # 執行模擬
     results = []
-    backtester = Backtester(best_config)
-    
+
     for i in range(n_simulations):
         # 隨機選擇起始點
         max_start = total_rows - window_size
@@ -917,21 +916,22 @@ def run_monte_carlo(smart_result, df, sym_config, n_simulations, window_pct):
             start_idx = 0
         else:
             start_idx = np.random.randint(0, max_start)
-        
+
         # 截取數據窗口
-        window_df = df.iloc[start_idx:start_idx + window_size].copy()
-        
+        window_df = df.iloc[start_idx:start_idx + window_size].copy().reset_index(drop=True)
+
         try:
-            # 執行回測
-            result = backtester.run(window_df)
+            # 每次模擬創建新的回測器實例
+            backtester = GridBacktester(window_df, best_config)
+            bt_result = backtester.run()
             results.append({
                 "simulation": i + 1,
                 "start_idx": start_idx,
-                "return_pct": result.get("return_pct", 0) * 100,
-                "max_drawdown": result.get("max_drawdown", 0) * 100,
-                "win_rate": result.get("win_rate", 0) * 100,
-                "trades": result.get("trades_count", 0),
-                "sharpe": result.get("sharpe_ratio", 0) if result.get("sharpe_ratio") else 0,
+                "return_pct": bt_result.return_pct * 100,
+                "max_drawdown": bt_result.max_drawdown * 100,
+                "win_rate": bt_result.win_rate * 100,
+                "trades": bt_result.trades_count,
+                "sharpe": bt_result.sharpe_ratio if bt_result.sharpe_ratio else 0,
             })
         except Exception as e:
             # 跳過失敗的模擬
