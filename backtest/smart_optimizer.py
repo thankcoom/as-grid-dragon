@@ -74,24 +74,35 @@ class TradingMode(Enum):
 
 
 # 各模式的參數範圍預設
+# 設計原則:
+#   1. take_profit_spacing 必須 > 0.15% (覆蓋 0.08% 手續費 + 合理利潤)
+#   2. grid_spacing > take_profit_spacing × 1.2 (留出止盈空間)
+#   3. 範圍要夠寬，讓優化器有足夠空間探索
+#   4. 三種模式有適度重疊，允許在邊界找到最佳點
 MODE_PARAM_BOUNDS = {
     TradingMode.HIGH_FREQ: {
-        "take_profit_spacing": (0.0008, 0.0025),   # 0.08% ~ 0.25%
-        "grid_spacing": (0.0012, 0.0040),          # 0.12% ~ 0.40%
-        "limit_multiplier": (2.0, 5.0),            # 快速加倍出貨
-        "threshold_multiplier": (5.0, 12.0),       # 保守裝死閾值
+        # 次高頻：小間距高頻交易，快速累積小利潤
+        # 風險：單邊行情容易快速累積大倉位
+        "take_profit_spacing": (0.0015, 0.0050),   # 0.15% ~ 0.50%
+        "grid_spacing": (0.0020, 0.0080),          # 0.20% ~ 0.80%
+        "limit_multiplier": (2.0, 8.0),            # 較早觸發加倍出貨
+        "threshold_multiplier": (6.0, 20.0),       # 較早觸發裝死，控制風險
     },
     TradingMode.SWING: {
-        "take_profit_spacing": (0.0025, 0.0080),   # 0.25% ~ 0.80%
-        "grid_spacing": (0.0040, 0.0150),          # 0.40% ~ 1.50%
-        "limit_multiplier": (4.0, 10.0),           # 平衡風險與容量
-        "threshold_multiplier": (10.0, 25.0),      # 中等裝死閾值
+        # 波動模式：中等間距，捕捉波段利潤
+        # 平衡交易頻率與單筆利潤
+        "take_profit_spacing": (0.0030, 0.0150),   # 0.30% ~ 1.50%
+        "grid_spacing": (0.0050, 0.0300),          # 0.50% ~ 3.00%
+        "limit_multiplier": (3.0, 15.0),           # 中等加倍觸發
+        "threshold_multiplier": (10.0, 40.0),      # 中等裝死閾值
     },
     TradingMode.LONG_CYCLE: {
-        "take_profit_spacing": (0.0080, 0.0300),   # 0.80% ~ 3.00%
-        "grid_spacing": (0.0150, 0.0600),          # 1.50% ~ 6.00%
-        "limit_multiplier": (8.0, 20.0),           # 允許大倉位
-        "threshold_multiplier": (20.0, 50.0),      # 高容忍度
+        # 大週期：大間距，只抓大波動
+        # 可承受較大倉位，等待較大反彈
+        "take_profit_spacing": (0.0080, 0.0500),   # 0.80% ~ 5.00%
+        "grid_spacing": (0.0150, 0.1000),          # 1.50% ~ 10.00%
+        "limit_multiplier": (5.0, 30.0),           # 允許較大倉位累積
+        "threshold_multiplier": (15.0, 80.0),      # 高容忍度，等待大反彈
     },
 }
 
@@ -203,12 +214,13 @@ class SmartOptimizer:
     - 支持多目標權衡
     """
 
-    # 參數邊界定義
+    # 參數邊界定義 (未指定模式時的預設範圍)
+    # 涵蓋所有模式的合理範圍
     DEFAULT_PARAM_BOUNDS = {
-        "take_profit_spacing": (0.001, 0.015),   # 0.1% ~ 1.5%
-        "grid_spacing": (0.002, 0.025),           # 0.2% ~ 2.5%
-        "limit_multiplier": (2.0, 10.0),          # 止盈加倍倍數 2x ~ 10x
-        "threshold_multiplier": (6.0, 20.0),      # 裝死模式倍數 6x ~ 20x
+        "take_profit_spacing": (0.0015, 0.0300),  # 0.15% ~ 3.00%
+        "grid_spacing": (0.0020, 0.0600),         # 0.20% ~ 6.00%
+        "limit_multiplier": (2.0, 20.0),          # 止盈加倍倍數 2x ~ 20x
+        "threshold_multiplier": (6.0, 50.0),      # 裝死模式倍數 6x ~ 50x
     }
 
     # 固定參數 (不優化)
