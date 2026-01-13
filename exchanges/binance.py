@@ -271,21 +271,11 @@ class BinanceAdapter(ExchangeAdapter):
         position_side: str = "BOTH",
         reduce_only: bool = False
     ) -> Dict:
-        """
-        創建限價單
-        
-        Binance 對沖模式特殊處理:
-        - 當設置 positionSide 時，不應傳遞 reduceOnly 參數
-        - 透過 positionSide + 反方向操作已能明確表示平倉單
-        """
-        params = {}
-
-        # 對沖模式: 只有在 BOTH 模式下才傳遞 reduceOnly
-        if position_side == "BOTH" and reduce_only:
-            params["reduceOnly"] = True
+        """創建限價單 (與終端版一致)"""
+        params = {'reduce_only': reduce_only}
 
         if position_side != "BOTH":
-            params["positionSide"] = position_side
+            params['positionSide'] = position_side
 
         order = self.exchange.create_order(
             symbol=symbol,
@@ -307,20 +297,11 @@ class BinanceAdapter(ExchangeAdapter):
         position_side: str = "BOTH",
         reduce_only: bool = False
     ) -> Dict:
-        """
-        創建市價單
-        
-        Binance 對沖模式特殊處理:
-        - 當設置 positionSide 時，不應傳遞 reduceOnly 參數
-        """
-        params = {}
-
-        # 對沖模式: 只有在 BOTH 模式下才傳遞 reduceOnly
-        if position_side == "BOTH" and reduce_only:
-            params["reduceOnly"] = True
+        """創建市價單 (與終端版一致)"""
+        params = {'reduce_only': reduce_only}
 
         if position_side != "BOTH":
-            params["positionSide"] = position_side
+            params['positionSide'] = position_side
 
         order = self.exchange.create_order(
             symbol=symbol,
