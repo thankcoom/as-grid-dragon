@@ -143,6 +143,19 @@ docker-compose down
 
 ## 配置說明
 
+### 各交易所認證機制
+
+| 交易所 | API Key | API Secret | Passphrase | 說明 |
+|--------|---------|------------|------------|------|
+| Binance | ✅ | ✅ | ❌ | 2 因素認證 |
+| Bybit | ✅ | ✅ | ❌ | 2 因素認證 |
+| Gate.io | ✅ | ✅ | ❌ | 2 因素認證 |
+| **Bitget** | ✅ | ✅ | **✅ 必需** | **3 因素認證** |
+
+> **為什麼 Bitget 需要 Passphrase？**
+>
+> 這是 Bitget 官方 API 的強制安全設計。創建 API Key 時必須設定一個 Passphrase（密碼短語），每次 API 請求都需要這三個憑證。即使 API Key 和 Secret 洩露，沒有 Passphrase 仍無法操作，提供額外一層安全保護。
+
 ### API 權限需求
 
 | 權限 | 必要性 |
