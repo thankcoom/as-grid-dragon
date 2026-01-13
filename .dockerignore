@@ -1,0 +1,67 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 本地配置 (Docker 會掛載 volume)
+# config/trading_config_max.json
+
+# 測試和文檔
+tests/
+docs/
+*.md
+!requirements*.txt
+
+# 日誌
+*.log
+logs/
+
+# 其他專案資料夾
+bitget_as/
+bittap_as/
+louisasgrid-bitbap/
+AS刷怪籠/
+
+# 備份檔案
+*.backup*
+*.bak
+
+# macOS
+.DS_Store
+
+# 壓縮檔
+*.zip

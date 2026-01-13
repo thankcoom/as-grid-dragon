@@ -1,0 +1,29 @@
+# AS 網格交易系統 - Docker 依賴
+
+# Web UI
+streamlit>=1.28.0
+streamlit-autorefresh>=1.0.0
+
+# 數據處理
+pandas>=2.0.0
+numpy>=1.24.0
+
+# 圖表
+plotly>=5.15.0
+
+# 交易所 API
+ccxt>=4.0.0
+aiohttp>=3.9.0
+websockets>=12.0
+
+# 加密
+cryptography>=41.0.0
+
+# SSL 憑證
+certifi
+
+# 優化器 (回測用)
+optuna>=3.0.0
+
+# Rich (終端 UI - 保留兼容性)
+rich>=13.0.0
