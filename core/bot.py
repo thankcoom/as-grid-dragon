@@ -251,6 +251,29 @@ class MaxGridBot:
             except Exception as e:
                 logger.error(f"同步 {ccxt_symbol} 掛單失敗: {e}")
 
+    async def _sync_funding_rates(self):
+        """
+        同步所有交易對的 Funding Rate (與 Terminal 版一致)
+        
+        用於:
+        1. Funding Rate 偏向機制
+        2. 調整多空持倉偏好
+        """
+        if not self.funding_manager:
+            return
+        
+        for sym_config in self.config.symbols.values():
+            if not sym_config.enabled:
+                continue
+            
+            try:
+                rate = self.funding_manager.update_funding_rate(sym_config.ccxt_symbol)
+                sym_state = self.state.symbols.get(sym_config.ccxt_symbol)
+                if sym_state:
+                    sym_state.current_funding_rate = rate
+            except Exception as e:
+                logger.debug(f"同步 {sym_config.symbol} Funding Rate 失敗: {e}")
+
     async def run(self):
         try:
             print("[Bot] 開始初始化交易所...")
@@ -291,6 +314,37 @@ class MaxGridBot:
         self.state.running = False
         if self.ws:
             await self.ws.close()
+
+    def reload_config(self, new_config: GlobalConfig):
+        """
+        重新載入配置並套用到運行中的 Bot (與 Terminal 版一致)
+        
+        可動態更新:
+        - symbols 參數 (間距、數量等)
+        - risk 參數
+        - bandit 參數
+        - leading_indicator 參數
+        """
+        # 保留關鍵運行狀態
+        old_api_key = self.config.api_key
+        old_api_secret = self.config.api_secret
+        
+        # 更新配置
+        self.config = new_config
+        
+        # 確保 API 密鑰不變 (運行中不可更改)
+        self.config.api_key = old_api_key
+        self.config.api_secret = old_api_secret
+        
+        # 更新 Bandit 配置
+        if hasattr(self.bandit_optimizer, 'config'):
+            self.bandit_optimizer.config = new_config.bandit
+        
+        # 更新領先指標配置
+        if hasattr(self.leading_indicator, 'config'):
+            self.leading_indicator.config = new_config.leading_indicator
+        
+        logger.info("[Bot] 配置已重新載入")
 
     async def _websocket_loop(self):
         """WebSocket 主循環 (使用 Adapter 構建 URL)"""
@@ -342,8 +396,11 @@ class MaxGridBot:
             await asyncio.sleep(self.config.sync_interval)
             await self._sync_positions()
             await self._sync_orders()
+            await self._sync_funding_rates()  # 同步 Funding Rate
             # 風控檢查
             await self._risk_monitor_loop()
+            # 減倉檢查
+            await self._check_and_reduce_positions()
 
     async def _handle_message(self, message: str):
         """處理 WebSocket 消息 (使用 Adapter 解析)"""
@@ -545,16 +602,8 @@ class MaxGridBot:
         
         # 計算實際名義價值
         notional = base_qty * price
-        print(f"[Place] {cfg.symbol} 價格={price:.6f}, 多倉={long_pos}, 空倉={short_pos}, 數量={base_qty}, 名義價值={notional:.2f}U")
         
-        tp_spacing, gs_spacing = cfg.take_profit_spacing, cfg.grid_spacing
-        if self.config.bandit.enabled:
-            params = self.bandit_optimizer.get_current_params()
-            tp_spacing = params.take_profit_spacing
-            gs_spacing = params.grid_spacing
-        if self.config.leading_indicator.enabled:
-            adjusted, reason = self.leading_indicator.get_spacing_adjustment(ccxt_sym, gs_spacing)
-            gs_spacing = adjusted
+        tp_spacing, gs_spacing = self._get_dynamic_spacing(cfg, sym_state)
 
         # 計算策略決策
         long_decision = GridStrategy.get_grid_decision(
@@ -665,6 +714,199 @@ class MaxGridBot:
                     await asyncio.to_thread(self.adapter.cancel_order, order['id'], symbol)
         except Exception as e:
             logger.error(f"撤單失敗 {symbol}: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # MAX 增強功能 (與 Terminal 版一致)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _get_dynamic_spacing(self, cfg, sym_state) -> tuple:
+        """
+        獲取動態調整後的間距 (與 Terminal 版一致)
+        
+        優先順序:
+        1. 領先指標 (OFI, Volume, Spread) - 預測未來波動
+        2. 動態網格 (ATR) - 滯後指標作為備用
+        3. GLFT 偏移 - 庫存控制
+        """
+        max_cfg = self.config.max_enhancement
+        ccxt_symbol = cfg.ccxt_symbol
+        
+        # 基礎間距
+        base_take_profit = cfg.take_profit_spacing
+        base_grid_spacing = cfg.grid_spacing
+        
+        # === 1. Bandit 參數 ===
+        if self.config.bandit.enabled:
+            params = self.bandit_optimizer.get_current_params()
+            base_take_profit = params.take_profit_spacing
+            base_grid_spacing = params.grid_spacing
+        
+        # === 2. 領先指標調整 (優先於 ATR) ===
+        leading_reason = ""
+        if self.config.leading_indicator.enabled:
+            # 檢查是否應該暫停交易 (極端情況)
+            should_pause, pause_reason = self.leading_indicator.should_pause_trading(ccxt_symbol)
+            if should_pause:
+                logger.warning(f"[LeadingIndicator] {cfg.symbol} 暫停交易: {pause_reason}")
+                base_take_profit *= 2.0
+                base_grid_spacing *= 2.0
+                leading_reason = f"暫停:{pause_reason}"
+            else:
+                # 正常領先指標調整
+                adjusted_spacing, leading_reason = self.leading_indicator.get_spacing_adjustment(
+                    ccxt_symbol, base_grid_spacing
+                )
+                if adjusted_spacing != base_grid_spacing:
+                    ratio = adjusted_spacing / base_grid_spacing
+                    base_grid_spacing = adjusted_spacing
+                    base_take_profit *= ratio  # 等比例調整止盈
+        
+        # === 3. 動態網格範圍 (ATR - 滯後指標) ===
+        if not leading_reason or leading_reason == "正常":
+            take_profit, grid_spacing = self.dynamic_grid.get_dynamic_spacing(
+                ccxt_symbol,
+                base_take_profit,
+                base_grid_spacing,
+                max_cfg
+            )
+        else:
+            take_profit = base_take_profit
+            grid_spacing = base_grid_spacing
+        
+        # === 4. GLFT 偏移 (根據庫存調整) ===
+        bid_skew, ask_skew = self.glft_controller.calculate_spread_skew(
+            sym_state.long_position,
+            sym_state.short_position,
+            grid_spacing,
+            max_cfg
+        )
+        
+        # 記錄到狀態
+        sym_state.dynamic_take_profit = take_profit
+        sym_state.dynamic_grid_spacing = grid_spacing
+        sym_state.inventory_ratio = self.glft_controller.calculate_inventory_ratio(
+            sym_state.long_position, sym_state.short_position
+        )
+        
+        return take_profit, grid_spacing
+
+    def _get_adjusted_quantity(self, cfg, sym_state, side: str, is_take_profit: bool) -> float:
+        """
+        獲取調整後的數量 (與 Terminal 版一致)
+        整合: Funding Rate 偏向 + GLFT 數量調整 + 原有邏輯
+        """
+        max_cfg = self.config.max_enhancement
+        base_qty = cfg.initial_quantity
+        
+        # 1. 原有邏輯: position_limit / position_threshold
+        if is_take_profit:
+            if side == 'long':
+                if sym_state.long_position > cfg.position_limit:
+                    base_qty *= 2
+                elif sym_state.short_position >= cfg.position_threshold:
+                    base_qty *= 2
+            else:
+                if sym_state.short_position > cfg.position_limit:
+                    base_qty *= 2
+                elif sym_state.long_position >= cfg.position_threshold:
+                    base_qty *= 2
+        
+        # 2. GLFT 數量調整 (補倉時)
+        if not is_take_profit:
+            base_qty = self.glft_controller.adjust_order_quantity(
+                base_qty, side,
+                sym_state.long_position, sym_state.short_position,
+                max_cfg
+            )
+        
+        # 3. Funding Rate 偏向
+        if self.funding_manager:
+            long_bias, short_bias = self.funding_manager.get_position_bias(
+                cfg.ccxt_symbol, max_cfg
+            )
+            if side == 'long':
+                base_qty *= long_bias
+            else:
+                base_qty *= short_bias
+        
+        return max(cfg.initial_quantity * 0.5, base_qty)
+
+    async def _check_and_reduce_positions(self):
+        """
+        檢查並減倉 (雙向持倉過大時) - 與 Terminal 版一致
+        """
+        REDUCE_COOLDOWN = 60  # 減倉冷卻時間
+        
+        for sym_config in self.config.symbols.values():
+            if not sym_config.enabled:
+                continue
+            
+            ccxt_symbol = sym_config.ccxt_symbol
+            sym_state = self.state.symbols.get(ccxt_symbol)
+            if not sym_state:
+                continue
+            
+            local_threshold = sym_config.position_threshold * 0.8
+            reduce_qty = sym_config.position_threshold * 0.1
+            
+            # 冷卻時間檢查
+            last_reduce = self.state.last_reduce_time.get(ccxt_symbol, 0)
+            import time
+            if time.time() - last_reduce < REDUCE_COOLDOWN:
+                continue
+            
+            # 雙向持倉都過大時減倉
+            if (sym_state.long_position >= local_threshold and 
+                sym_state.short_position >= local_threshold):
+                logger.info(f"[風控] {sym_config.symbol} 多空持倉均超過 {local_threshold}，開始雙向減倉")
+                
+                try:
+                    # 市價平多
+                    if sym_state.long_position > 0:
+                        await asyncio.to_thread(
+                            self.adapter.create_market_order,
+                            ccxt_symbol, 'sell', reduce_qty,
+                            position_side='LONG', reduce_only=True
+                        )
+                        logger.info(f"[風控] {sym_config.symbol} 市價平多 {reduce_qty}")
+                    
+                    # 市價平空
+                    if sym_state.short_position > 0:
+                        await asyncio.to_thread(
+                            self.adapter.create_market_order,
+                            ccxt_symbol, 'buy', reduce_qty,
+                            position_side='SHORT', reduce_only=True
+                        )
+                        logger.info(f"[風控] {sym_config.symbol} 市價平空 {reduce_qty}")
+                    
+                    self.state.last_reduce_time[ccxt_symbol] = time.time()
+                except Exception as e:
+                    logger.error(f"[風控] 減倉失敗: {e}")
+
+    def _should_adjust_grid(self, cfg, sym_state, side: str) -> bool:
+        """
+        檢查是否需要調整網格 (與 Terminal 版一致)
+        避免頻繁取消重掛訂單
+        """
+        price = sym_state.latest_price
+        deviation_threshold = cfg.grid_spacing * 0.5
+        
+        if side == 'long':
+            # 沒有掛單時必須調整
+            if sym_state.buy_long_orders <= 0 or sym_state.sell_long_orders <= 0:
+                return True
+            # 價格偏離過大時調整
+            if sym_state.last_grid_price_long > 0:
+                deviation = abs(price - sym_state.last_grid_price_long) / sym_state.last_grid_price_long
+                return deviation >= deviation_threshold
+            return True
+        else:
+            if sym_state.buy_short_orders <= 0 or sym_state.sell_short_orders <= 0:
+                return True
+            if sym_state.last_grid_price_short > 0:
+                deviation = abs(price - sym_state.last_grid_price_short) / sym_state.last_grid_price_short
+                return deviation >= deviation_threshold
+            return True
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 風控邏輯
