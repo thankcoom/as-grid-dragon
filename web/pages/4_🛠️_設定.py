@@ -525,6 +525,49 @@ def render_risk_settings():
                 risk.trailing_drawdown_pct = new_drawdown
                 save_config()
 
+        # === 硬止損設定 ===
+        st.markdown("##### 🚨 硬止損")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            hard_stop = st.checkbox(
+                "啟用硬止損",
+                value=risk.hard_stop_enabled,
+                help="當單方向浮虧超過閾值時強制平倉"
+            )
+            if hard_stop != risk.hard_stop_enabled:
+                risk.hard_stop_enabled = hard_stop
+                save_config()
+        
+        with col2:
+            if risk.hard_stop_enabled:
+                max_loss = st.slider(
+                    "最大虧損 (%)",
+                    min_value=1,
+                    max_value=10,
+                    value=int(risk.max_loss_pct * 100),
+                    step=1,
+                    help="單邊虧損達此比例時強制平倉"
+                )
+                new_max_loss = max_loss / 100
+                if new_max_loss != risk.max_loss_pct:
+                    risk.max_loss_pct = new_max_loss
+                    save_config()
+
+        # === 趨勢過濾器 (實驗性) ===
+        st.markdown("##### 🧪 趨勢過濾器 (實驗性)")
+        st.caption("⚠️ 此功能可能改變網格策略的本質。啟用後會根據 MA 方向限制開倉方向。")
+        
+        # 趨勢過濾需要在 SymbolConfig 層級設置，這裡只顯示說明
+        st.info("""
+        **趨勢過濾器說明:**
+        - 價格 > MA200: 只做多
+        - 價格 < MA200: 只做空
+        - 預設關閉，可在配置文件中啟用
+        
+        配置項: `trend_filter_enabled`, `trend_ma_period`, `trend_buffer_pct`
+        """)
+
 
 def main():
     """主函數"""
