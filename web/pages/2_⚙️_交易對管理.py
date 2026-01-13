@@ -28,6 +28,13 @@ from utils import normalize_symbol
 
 init_session_state()
 
+# 交易模式定義
+TRADING_MODES = {
+    "high_freq": {"name": "🚀 次高頻", "desc": "2-7天，小間距"},
+    "swing": {"name": "📊 波動", "desc": "1週-1月，中間距"},
+    "long_cycle": {"name": "🌊 大週期", "desc": "1月以上，大間距"},
+}
+
 
 def render_symbols_list():
     """渲染交易對列表"""
@@ -41,8 +48,10 @@ def render_symbols_list():
 
     for symbol, cfg in list(config.symbols.items()):
         status_icon = "🟢" if cfg.enabled else "⚪"
+        mode_key = getattr(cfg, 'trading_mode', 'swing')
+        mode_info = TRADING_MODES.get(mode_key, TRADING_MODES['swing'])
 
-        with st.expander(f"{status_icon} {symbol}", expanded=False):
+        with st.expander(f"{status_icon} {symbol}  {mode_info['name']}", expanded=False):
             col1, col2, col3, col4 = st.columns(4)
 
             with col1:
@@ -129,6 +138,17 @@ def render_add_symbol():
                 help="合約槓桿倍數"
             )
 
+        # 交易模式選擇
+        st.markdown("**交易模式**")
+        trading_mode = st.radio(
+            "選擇交易模式",
+            options=list(TRADING_MODES.keys()),
+            format_func=lambda m: f"{TRADING_MODES[m]['name']} ({TRADING_MODES[m]['desc']})",
+            horizontal=True,
+            index=1,  # 預設波動模式
+            help="不同模式適合不同的持倉週期"
+        )
+
         # 進階選項
         with st.expander("進階選項"):
             limit_mult = st.number_input(
@@ -180,6 +200,7 @@ def render_add_symbol():
                 leverage=leverage,
                 limit_multiplier=limit_mult,
                 threshold_multiplier=threshold_mult,
+                trading_mode=trading_mode,
             )
             save_config()
 
@@ -256,6 +277,21 @@ def render_edit_symbol():
                 step=1.0,
             )
 
+        # 交易模式選擇
+        st.markdown("**交易模式**")
+        current_mode = getattr(cfg, 'trading_mode', 'swing')
+        mode_keys = list(TRADING_MODES.keys())
+        current_idx = mode_keys.index(current_mode) if current_mode in mode_keys else 1
+
+        trading_mode = st.radio(
+            "選擇交易模式",
+            options=mode_keys,
+            format_func=lambda m: f"{TRADING_MODES[m]['name']} ({TRADING_MODES[m]['desc']})",
+            horizontal=True,
+            index=current_idx,
+            key="edit_trading_mode"
+        )
+
         # 顯示計算值
         st.caption(f"position_limit = {quantity * limit_mult:.1f}")
         st.caption(f"position_threshold = {quantity * threshold_mult:.1f}")
@@ -269,6 +305,7 @@ def render_edit_symbol():
                 cfg.leverage = leverage
                 cfg.limit_multiplier = limit_mult
                 cfg.threshold_multiplier = threshold_mult
+                cfg.trading_mode = trading_mode
                 save_config()
 
                 st.session_state.editing_symbol = None

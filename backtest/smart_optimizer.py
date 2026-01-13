@@ -59,6 +59,65 @@ class OptimizationMethod(Enum):
     NSGA_III = "nsga_iii"       # 多目標演化算法 NSGA-III
 
 
+class TradingMode(Enum):
+    """
+    交易模式 - 決定優化參數範圍
+
+    根據預期持倉週期選擇不同模式：
+    - HIGH_FREQ: 次高頻刷量 (2-7天)
+    - SWING: 波動模式 (1週-1月)
+    - LONG_CYCLE: 大週期模式 (1月以上)
+    """
+    HIGH_FREQ = "high_freq"     # 🚀 次高頻：小間距、高頻刷量
+    SWING = "swing"             # 📊 波動：中等間距、捕捉波段
+    LONG_CYCLE = "long_cycle"   # 🌊 大週期：大間距、長期持有
+
+
+# 各模式的參數範圍預設
+MODE_PARAM_BOUNDS = {
+    TradingMode.HIGH_FREQ: {
+        "take_profit_spacing": (0.0008, 0.0025),   # 0.08% ~ 0.25%
+        "grid_spacing": (0.0012, 0.0040),          # 0.12% ~ 0.40%
+        "limit_multiplier": (2.0, 5.0),            # 快速加倍出貨
+        "threshold_multiplier": (5.0, 12.0),       # 保守裝死閾值
+    },
+    TradingMode.SWING: {
+        "take_profit_spacing": (0.0025, 0.0080),   # 0.25% ~ 0.80%
+        "grid_spacing": (0.0040, 0.0150),          # 0.40% ~ 1.50%
+        "limit_multiplier": (4.0, 10.0),           # 平衡風險與容量
+        "threshold_multiplier": (10.0, 25.0),      # 中等裝死閾值
+    },
+    TradingMode.LONG_CYCLE: {
+        "take_profit_spacing": (0.0080, 0.0300),   # 0.80% ~ 3.00%
+        "grid_spacing": (0.0150, 0.0600),          # 1.50% ~ 6.00%
+        "limit_multiplier": (8.0, 20.0),           # 允許大倉位
+        "threshold_multiplier": (20.0, 50.0),      # 高容忍度
+    },
+}
+
+# 模式顯示資訊
+MODE_INFO = {
+    TradingMode.HIGH_FREQ: {
+        "name": "🚀 次高頻",
+        "description": "小間距、高頻刷量",
+        "timeframe": "2-7 天",
+        "best_for": "穩定幣對、低波動行情",
+    },
+    TradingMode.SWING: {
+        "name": "📊 波動",
+        "description": "中等間距、捕捉波段",
+        "timeframe": "1週 - 1月",
+        "best_for": "一般山寨幣、中等波動",
+    },
+    TradingMode.LONG_CYCLE: {
+        "name": "🌊 大週期",
+        "description": "大間距、長期持有",
+        "timeframe": "1月以上",
+        "best_for": "高波動幣種、趨勢市場",
+    },
+}
+
+
 @dataclass
 class TrialResult:
     """單次試驗結果"""
@@ -166,6 +225,7 @@ class SmartOptimizer:
         base_config: Config = None,
         param_bounds: Dict[str, Tuple[float, float]] = None,
         fixed_params: Dict[str, Any] = None,
+        trading_mode: TradingMode = None,
         logger: logging.Logger = None
     ):
         """
@@ -174,15 +234,24 @@ class SmartOptimizer:
         Args:
             df: K線數據
             base_config: 基礎配置
-            param_bounds: 參數範圍 {name: (min, max)}
+            param_bounds: 參數範圍 {name: (min, max)}，如果指定 trading_mode 則忽略
             fixed_params: 固定參數
+            trading_mode: 交易模式 (HIGH_FREQ/SWING/LONG_CYCLE)
             logger: 日誌器
         """
         self.df = df
         self.base_config = base_config or Config()
-        self.param_bounds = param_bounds or self.DEFAULT_PARAM_BOUNDS.copy()
-        self.fixed_params = fixed_params or self.DEFAULT_FIXED_PARAMS.copy()
         self.logger = logger or logging.getLogger("SmartOptimizer")
+
+        # 根據交易模式設置參數範圍
+        self.trading_mode = trading_mode
+        if trading_mode is not None:
+            self.param_bounds = MODE_PARAM_BOUNDS[trading_mode].copy()
+            self.logger.info(f"使用交易模式: {MODE_INFO[trading_mode]['name']}")
+        else:
+            self.param_bounds = param_bounds or self.DEFAULT_PARAM_BOUNDS.copy()
+
+        self.fixed_params = fixed_params or self.DEFAULT_FIXED_PARAMS.copy()
 
         # 優化狀態
         self._study = None

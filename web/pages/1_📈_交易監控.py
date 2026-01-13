@@ -186,6 +186,15 @@ def render_symbol_details():
 
     cfg = config.symbols[symbol]
 
+    # 交易模式標籤
+    mode_labels = {
+        "high_freq": "🚀 次高頻",
+        "swing": "📊 波動",
+        "long_cycle": "🌊 大週期",
+    }
+    mode_label = mode_labels.get(getattr(cfg, 'trading_mode', 'swing'), "📊 波動")
+    st.info(f"**交易模式**: {mode_label}")
+
     col1, col2 = st.columns(2)
 
     with col1:

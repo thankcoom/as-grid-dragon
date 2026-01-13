@@ -213,6 +213,12 @@ class SymbolConfig:
     limit_multiplier: float = 5.0       # 5單後止盈加倍
     threshold_multiplier: float = 20.0  # 20單後裝死
 
+    # 交易模式 - 用於優化器參數範圍選擇
+    # "high_freq": 🚀 次高頻 (2-7天)
+    # "swing": 📊 波動 (1週-1月)
+    # "long_cycle": 🌊 大週期 (1月以上)
+    trading_mode: str = "swing"
+
     @property
     def coin_name(self) -> str:
         return self.ccxt_symbol.split('/')[0]
@@ -246,6 +252,7 @@ class SymbolConfig:
             "leverage": self.leverage,
             "limit_multiplier": self.limit_multiplier,
             "threshold_multiplier": self.threshold_multiplier,
+            "trading_mode": self.trading_mode,
         }
 
     @classmethod

@@ -32,11 +32,16 @@ from core.backtest import BacktestManager
 
 # 檢查智能優化是否可用
 try:
-    from backtest.smart_optimizer import SmartOptimizer, OptimizationObjective, OptimizationMethod
+    from backtest.smart_optimizer import (
+        SmartOptimizer, OptimizationObjective, OptimizationMethod,
+        TradingMode, MODE_INFO
+    )
     from backtest.config import Config as BacktestConfig
     SMART_OPTIMIZER_AVAILABLE = True
 except ImportError:
     SMART_OPTIMIZER_AVAILABLE = False
+    TradingMode = None
+    MODE_INFO = None
 
 init_session_state()
 
@@ -291,7 +296,7 @@ def render_backtest_result(result: dict):
 def run_optimization(manager: BacktestManager, symbol: str, ccxt_symbol: str,
                      sym_config: SymbolConfig, start_date: str, end_date: str,
                      use_smart: bool = True, n_trials: int = 100,
-                     objective: str = "sharpe"):
+                     objective: str = "sharpe", trading_mode=None):
     """執行參數優化 - 支援智能優化與傳統網格搜索"""
     # 載入數據 (與單筆回測相同)
     available_dates = manager.get_available_dates(symbol)
@@ -320,7 +325,9 @@ def run_optimization(manager: BacktestManager, symbol: str, ccxt_symbol: str,
 
     # 智能優化模式
     if use_smart and SMART_OPTIMIZER_AVAILABLE:
-        results, smart_result, optimizer = run_smart_optimization(df, sym_config, n_trials, objective)
+        results, smart_result, optimizer = run_smart_optimization(
+            df, sym_config, n_trials, objective, trading_mode
+        )
         return results, smart_result, optimizer, df
     else:
         # 傳統網格優化
@@ -338,8 +345,8 @@ def run_optimization(manager: BacktestManager, symbol: str, ccxt_symbol: str,
         return results, None, None, df
 
 
-def run_smart_optimization(df: pd.DataFrame, sym_config: SymbolConfig, 
-                           n_trials: int, objective: str):
+def run_smart_optimization(df: pd.DataFrame, sym_config: SymbolConfig,
+                           n_trials: int, objective: str, trading_mode=None):
     """執行智能優化 (使用 Optuna TPE)"""
     # 轉換配置
     base_config = BacktestConfig(
@@ -349,7 +356,7 @@ def run_smart_optimization(df: pd.DataFrame, sym_config: SymbolConfig,
         take_profit_spacing=sym_config.take_profit_spacing,
         grid_spacing=sym_config.grid_spacing,
     )
-    
+
     # 選擇優化目標
     objective_map = {
         "return": OptimizationObjective.RETURN,
@@ -360,9 +367,14 @@ def run_smart_optimization(df: pd.DataFrame, sym_config: SymbolConfig,
         "risk_adjusted": OptimizationObjective.RISK_ADJUSTED,
     }
     opt_objective = objective_map.get(objective, OptimizationObjective.SHARPE)
-    
-    # 創建優化器
-    optimizer = SmartOptimizer(df, base_config)
+
+    # 創建優化器（傳入交易模式）
+    optimizer = SmartOptimizer(df, base_config, trading_mode=trading_mode)
+
+    # 顯示使用的模式
+    if trading_mode is not None:
+        mode_info = MODE_INFO[trading_mode]
+        st.info(f"🎯 交易模式: {mode_info['name']} | {mode_info['description']}")
     
     progress_bar = st.progress(0, text="智能優化中...")
     status_text = st.empty()
@@ -1110,7 +1122,7 @@ def render_monte_carlo_results(results, smart_result):
 def render_optimization_settings():
     """渲染優化設定"""
     st.subheader("🧠 優化設定")
-    
+
     # 優化模式
     use_smart = st.toggle(
         "啟用智能優化 (TPE)",
@@ -1118,13 +1130,36 @@ def render_optimization_settings():
         disabled=not SMART_OPTIMIZER_AVAILABLE,
         help="使用 Optuna TPE 算法進行智能參數搜索，比網格搜索更高效"
     )
-    
+
     if not SMART_OPTIMIZER_AVAILABLE:
         st.caption("⚠️ 請安裝 Optuna: `pip install optuna`")
-    
+
     if use_smart and SMART_OPTIMIZER_AVAILABLE:
+        # 交易模式選擇
+        st.markdown("**📋 交易模式**")
+
+        trading_mode_options = [
+            TradingMode.HIGH_FREQ,
+            TradingMode.SWING,
+            TradingMode.LONG_CYCLE,
+        ]
+
+        selected_mode = st.radio(
+            "選擇交易模式",
+            options=trading_mode_options,
+            format_func=lambda m: f"{MODE_INFO[m]['name']} ({MODE_INFO[m]['timeframe']})",
+            horizontal=True,
+            help="不同模式有不同的參數範圍，適合不同的持倉週期"
+        )
+
+        # 顯示模式說明
+        mode_info = MODE_INFO[selected_mode]
+        st.caption(f"💡 {mode_info['description']} | 適合: {mode_info['best_for']}")
+
+        st.divider()
+
         col1, col2 = st.columns(2)
-        
+
         with col1:
             n_trials = st.select_slider(
                 "試驗次數",
@@ -1132,7 +1167,7 @@ def render_optimization_settings():
                 value=100,
                 help="更多試驗可能找到更好的參數，但耗時更長"
             )
-        
+
         with col2:
             objective = st.selectbox(
                 "優化目標",
@@ -1146,11 +1181,11 @@ def render_optimization_settings():
                 }.get(x, x),
                 help="Sharpe: 風險調整收益 | Sortino: 只計算下行風險 | Calmar: 收益/最大回撤"
             )
-        
-        return use_smart, n_trials, objective
+
+        return use_smart, n_trials, objective, selected_mode
     else:
         st.info("傳統網格優化: 21 種參數組合")
-        return False, 21, "return"
+        return False, 21, "return", None
 
 
 def main():
@@ -1189,13 +1224,13 @@ def main():
         )
         
         # 優化設定（僅在參數優化模式顯示）
-        use_smart, n_trials, objective = False, 21, "return"
+        use_smart, n_trials, objective, trading_mode = False, 21, "return", None
         if mode == "參數優化":
             st.divider()
-            use_smart, n_trials, objective = render_optimization_settings()
+            use_smart, n_trials, objective, trading_mode = render_optimization_settings()
 
         st.divider()
-        
+
         if st.button("🚀 開始", type="primary", use_container_width=True):
             st.session_state.backtest_mode = mode
             st.session_state.backtest_symbol = symbol
@@ -1206,6 +1241,7 @@ def main():
             st.session_state.use_smart = use_smart
             st.session_state.n_trials = n_trials
             st.session_state.objective = objective
+            st.session_state.trading_mode = trading_mode
             st.session_state.run_backtest = True
             st.rerun()
 
@@ -1228,10 +1264,12 @@ def main():
                 use_smart = st.session_state.get("use_smart", False)
                 n_trials = st.session_state.get("n_trials", 100)
                 objective = st.session_state.get("objective", "sharpe")
-                
+                trading_mode = st.session_state.get("trading_mode", None)
+
                 results, smart_result, optimizer, opt_df = run_optimization(
                     manager, symbol, ccxt_symbol, sym_config, start_date, end_date,
-                    use_smart=use_smart, n_trials=n_trials, objective=objective
+                    use_smart=use_smart, n_trials=n_trials, objective=objective,
+                    trading_mode=trading_mode
                 )
                 if results:
                     # 保存到 session state 供蒙特卡羅模擬使用
