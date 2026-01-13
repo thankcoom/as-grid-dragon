@@ -2,6 +2,7 @@
 回測/優化頁面
 =============
 回測、參數優化、結果分析
+支援智能優化 (Optuna TPE/NSGA-II) 與傳統網格搜索
 """
 
 import streamlit as st
@@ -28,6 +29,14 @@ from state import init_session_state, get_config, save_config
 from config.models import SymbolConfig
 from utils import normalize_symbol
 from core.backtest import BacktestManager
+
+# 檢查智能優化是否可用
+try:
+    from backtest.smart_optimizer import SmartOptimizer, OptimizationObjective, OptimizationMethod
+    from backtest.config import Config as BacktestConfig
+    SMART_OPTIMIZER_AVAILABLE = True
+except ImportError:
+    SMART_OPTIMIZER_AVAILABLE = False
 
 init_session_state()
 
@@ -280,8 +289,10 @@ def render_backtest_result(result: dict):
 
 
 def run_optimization(manager: BacktestManager, symbol: str, ccxt_symbol: str,
-                     sym_config: SymbolConfig, start_date: str, end_date: str):
-    """執行參數優化"""
+                     sym_config: SymbolConfig, start_date: str, end_date: str,
+                     use_smart: bool = True, n_trials: int = 100,
+                     objective: str = "sharpe"):
+    """執行參數優化 - 支援智能優化與傳統網格搜索"""
     # 載入數據 (與單筆回測相同)
     available_dates = manager.get_available_dates(symbol)
 
@@ -303,24 +314,96 @@ def run_optimization(manager: BacktestManager, symbol: str, ccxt_symbol: str,
 
     if df is None or df.empty:
         st.error("載入數據失敗")
-        return None
+        return None, None
 
     st.success(f"載入 {len(df):,} 條 K 線")
 
+    # 智能優化模式
+    if use_smart and SMART_OPTIMIZER_AVAILABLE:
+        return run_smart_optimization(df, sym_config, n_trials, objective)
+    else:
+        # 傳統網格優化
+        if use_smart and not SMART_OPTIMIZER_AVAILABLE:
+            st.warning("⚠️ 智能優化不可用 (請安裝 Optuna: pip install optuna)，改用傳統網格優化")
+        
+        progress_bar = st.progress(0, text="網格優化中...")
+
+        def update_progress(current, total):
+            progress_bar.progress(current / total, text=f"網格優化中... {current}/{total}")
+
+        results = manager.optimize_params(sym_config, df, update_progress)
+        progress_bar.progress(1.0, text="優化完成!")
+        
+        return results, None
+
+
+def run_smart_optimization(df: pd.DataFrame, sym_config: SymbolConfig, 
+                           n_trials: int, objective: str):
+    """執行智能優化 (使用 Optuna TPE)"""
+    # 轉換配置
+    base_config = BacktestConfig(
+        symbol=sym_config.symbol,
+        initial_quantity=sym_config.initial_quantity,
+        leverage=sym_config.leverage,
+        take_profit_spacing=sym_config.take_profit_spacing,
+        grid_spacing=sym_config.grid_spacing,
+    )
+    
+    # 選擇優化目標
+    objective_map = {
+        "return": OptimizationObjective.RETURN,
+        "sharpe": OptimizationObjective.SHARPE,
+        "sortino": OptimizationObjective.SORTINO,
+        "calmar": OptimizationObjective.CALMAR,
+        "profit_factor": OptimizationObjective.PROFIT_FACTOR,
+        "risk_adjusted": OptimizationObjective.RISK_ADJUSTED,
+    }
+    opt_objective = objective_map.get(objective, OptimizationObjective.SHARPE)
+    
+    # 創建優化器
+    optimizer = SmartOptimizer(df, base_config)
+    
+    progress_bar = st.progress(0, text="智能優化中...")
+    status_text = st.empty()
+    
+    def update_progress(current, total, best_value):
+        progress_bar.progress(current / total, text=f"智能優化中... {current}/{total}")
+        status_text.caption(f"當前最佳值: {best_value:.4f}")
+    
     # 執行優化
-    progress_bar = st.progress(0, text="優化中...")
+    result = optimizer.optimize(
+        n_trials=n_trials,
+        objective=opt_objective,
+        method=OptimizationMethod.TPE,
+        progress_callback=update_progress,
+        show_progress=False
+    )
+    
+    progress_bar.progress(1.0, text="智能優化完成!")
+    status_text.empty()
+    
+    # 轉換結果格式以兼容現有顯示
+    results = []
+    for trial in result.all_trials:
+        results.append({
+            "take_profit_spacing": trial.params.get("take_profit_spacing", sym_config.take_profit_spacing),
+            "grid_spacing": trial.params.get("grid_spacing", sym_config.grid_spacing),
+            "leverage": trial.params.get("leverage", sym_config.leverage),
+            "return_pct": trial.metrics.get("return_pct", 0),
+            "max_drawdown": trial.metrics.get("max_drawdown", 0),
+            "win_rate": trial.metrics.get("win_rate", 0),
+            "trades_count": trial.metrics.get("trades_count", 0),
+            "sharpe_ratio": trial.metrics.get("sharpe_ratio", 0),
+            "objective_value": trial.objective_value,
+        })
+    
+    # 按收益率排序
+    results.sort(key=lambda x: x["return_pct"], reverse=True)
+    
+    return results, result
 
-    def update_progress(current, total):
-        progress_bar.progress(current / total, text=f"優化中... {current}/{total}")
 
-    results = manager.optimize_params(sym_config, df, update_progress)
-
-    progress_bar.progress(1.0, text="優化完成!")
-
-    return results
-
-
-def render_optimization_results(results: list, symbol: str):
+def render_optimization_results(results: list, symbol: str, smart_result=None):
     """渲染優化結果"""
     st.subheader("🏆 優化結果 (Top 10)")
 
@@ -328,10 +411,23 @@ def render_optimization_results(results: list, symbol: str):
         st.warning("無優化結果")
         return
 
+    # 顯示優化摘要（如果是智能優化）
+    if smart_result is not None:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("總試驗數", smart_result.n_trials)
+        with col2:
+            st.metric("優化耗時", f"{smart_result.optimization_time:.1f}s")
+        with col3:
+            st.metric("最佳目標值", f"{smart_result.best_objective:.4f}")
+        with col4:
+            st.metric("優化方法", smart_result.method.upper())
+        st.divider()
+
     # 轉換為 DataFrame
     rows = []
     for r in results[:10]:
-        rows.append({
+        row = {
             "排名": len(rows) + 1,
             "止盈%": f"{r['take_profit_spacing']*100:.2f}",
             "補倉%": f"{r['grid_spacing']*100:.2f}",
@@ -339,10 +435,33 @@ def render_optimization_results(results: list, symbol: str):
             "回撤%": f"{r['max_drawdown']*100:.1f}",
             "勝率%": f"{r['win_rate']*100:.1f}",
             "交易數": r['trades_count'],
-        })
+        }
+        # 智能優化額外顯示 Sharpe
+        if "sharpe_ratio" in r and r["sharpe_ratio"]:
+            row["Sharpe"] = f"{r['sharpe_ratio']:.2f}"
+        # 顯示槓桿（如果被優化）
+        if "leverage" in r:
+            row["槓桿"] = r["leverage"]
+        rows.append(row)
 
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # 顯示參數重要性（智能優化）
+    if smart_result and smart_result.param_importance:
+        st.divider()
+        st.markdown("**📊 參數重要性分析**")
+        
+        import plotly.express as px
+        importance_df = pd.DataFrame([
+            {"參數": k, "重要性": v}
+            for k, v in smart_result.param_importance.items()
+        ]).sort_values("重要性", ascending=True)
+        
+        fig = px.bar(importance_df, x="重要性", y="參數", orientation="h",
+                     color="重要性", color_continuous_scale="Blues")
+        fig.update_layout(height=200, margin=dict(l=0, r=0, t=10, b=0))
+        st.plotly_chart(fig, use_container_width=True)
 
     # 應用最佳參數
     if results:
@@ -352,10 +471,10 @@ def render_optimization_results(results: list, symbol: str):
         col1, col2 = st.columns([3, 1])
 
         with col1:
-            st.markdown(
-                f"**最佳參數:** 止盈 {best['take_profit_spacing']*100:.2f}%, "
-                f"補倉 {best['grid_spacing']*100:.2f}%"
-            )
+            params_str = f"**最佳參數:** 止盈 {best['take_profit_spacing']*100:.2f}%, 補倉 {best['grid_spacing']*100:.2f}%"
+            if "leverage" in best:
+                params_str += f", 槓桿 {best['leverage']}x"
+            st.markdown(params_str)
 
         with col2:
             if st.button("套用最佳參數", type="primary"):
@@ -366,10 +485,58 @@ def render_optimization_results(results: list, symbol: str):
 
                 config.symbols[symbol].take_profit_spacing = best['take_profit_spacing']
                 config.symbols[symbol].grid_spacing = best['grid_spacing']
+                if "leverage" in best:
+                    config.symbols[symbol].leverage = best['leverage']
                 save_config()
 
                 st.success("已套用最佳參數!")
                 st.rerun()
+
+
+def render_optimization_settings():
+    """渲染優化設定"""
+    st.subheader("🧠 優化設定")
+    
+    # 優化模式
+    use_smart = st.toggle(
+        "啟用智能優化 (TPE)",
+        value=SMART_OPTIMIZER_AVAILABLE,
+        disabled=not SMART_OPTIMIZER_AVAILABLE,
+        help="使用 Optuna TPE 算法進行智能參數搜索，比網格搜索更高效"
+    )
+    
+    if not SMART_OPTIMIZER_AVAILABLE:
+        st.caption("⚠️ 請安裝 Optuna: `pip install optuna`")
+    
+    if use_smart and SMART_OPTIMIZER_AVAILABLE:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            n_trials = st.select_slider(
+                "試驗次數",
+                options=[50, 100, 200, 500],
+                value=100,
+                help="更多試驗可能找到更好的參數，但耗時更長"
+            )
+        
+        with col2:
+            objective = st.selectbox(
+                "優化目標",
+                options=["sharpe", "return", "sortino", "calmar", "risk_adjusted"],
+                format_func=lambda x: {
+                    "return": "📈 收益率 (Return)",
+                    "sharpe": "⚖️ 夏普比率 (Sharpe)",
+                    "sortino": "📉 索提諾比率 (Sortino)",
+                    "calmar": "🛡️ 卡瑪比率 (Calmar)",
+                    "risk_adjusted": "🎯 風險調整收益",
+                }.get(x, x),
+                help="Sharpe: 風險調整收益 | Sortino: 只計算下行風險 | Calmar: 收益/最大回撤"
+            )
+        
+        return use_smart, n_trials, objective
+    else:
+        st.info("傳統網格優化: 21 種參數組合")
+        return False, 21, "return"
 
 
 def main():
@@ -406,7 +573,15 @@ def main():
             options=["單筆回測", "參數優化"],
             horizontal=True,
         )
+        
+        # 優化設定（僅在參數優化模式顯示）
+        use_smart, n_trials, objective = False, 21, "return"
+        if mode == "參數優化":
+            st.divider()
+            use_smart, n_trials, objective = render_optimization_settings()
 
+        st.divider()
+        
         if st.button("🚀 開始", type="primary", use_container_width=True):
             st.session_state.backtest_mode = mode
             st.session_state.backtest_symbol = symbol
@@ -414,6 +589,9 @@ def main():
             st.session_state.backtest_config = sym_config
             st.session_state.backtest_start = start_date
             st.session_state.backtest_end = end_date
+            st.session_state.use_smart = use_smart
+            st.session_state.n_trials = n_trials
+            st.session_state.objective = objective
             st.session_state.run_backtest = True
             st.rerun()
 
@@ -433,11 +611,16 @@ def main():
                 if result:
                     render_backtest_result(result)
             else:
-                results = run_optimization(
-                    manager, symbol, ccxt_symbol, sym_config, start_date, end_date
+                use_smart = st.session_state.get("use_smart", False)
+                n_trials = st.session_state.get("n_trials", 100)
+                objective = st.session_state.get("objective", "sharpe")
+                
+                results, smart_result = run_optimization(
+                    manager, symbol, ccxt_symbol, sym_config, start_date, end_date,
+                    use_smart=use_smart, n_trials=n_trials, objective=objective
                 )
                 if results:
-                    render_optimization_results(results, symbol)
+                    render_optimization_results(results, symbol, smart_result)
 
             st.session_state.run_backtest = False
         else:
