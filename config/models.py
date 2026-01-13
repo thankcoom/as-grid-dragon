@@ -299,6 +299,7 @@ class GlobalConfig:
     # === API 憑證 ===
     api_key: str = ""
     api_secret: str = ""
+    api_password: str = ""  # Bitget 專用 Passphrase
 
     # === 系統設定 ===
     sync_interval: float = 30.0
@@ -322,6 +323,7 @@ class GlobalConfig:
             "testnet": self.testnet,
             "api_key": self.api_key,
             "api_secret": self.api_secret,
+            "api_password": self.api_password,
             "sync_interval": self.sync_interval,
             "symbols": {k: v.to_dict() for k, v in self.symbols.items()},
             "risk": self.risk.to_dict(),
@@ -350,6 +352,7 @@ class GlobalConfig:
             testnet=data.get("testnet", False),
             api_key=data.get("api_key", ""),
             api_secret=data.get("api_secret", ""),
+            api_password=data.get("api_password", ""),
             sync_interval=data.get("sync_interval", 30.0),
             legacy_api_detected=False
         )

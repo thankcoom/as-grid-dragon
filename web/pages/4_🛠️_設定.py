@@ -89,12 +89,25 @@ def render_api_settings():
             type="password",
         )
 
+        # Bitget 專用 Passphrase 欄位
+        api_password = ""
+        if config.exchange_type == "bitget":
+            st.info("Bitget 需要額外的 Passphrase（創建 API 時設定的密碼短語）")
+            api_password = st.text_input(
+                "Passphrase (密碼短語)",
+                value=config.api_password or "",
+                type="password",
+                help="Bitget 官方 API 的三因素認證要求"
+            )
+
         col1, col2 = st.columns(2)
 
         with col1:
             if st.button("保存 API"):
                 config.api_key = api_key
                 config.api_secret = api_secret
+                if config.exchange_type == "bitget":
+                    config.api_password = api_password
                 save_config()
                 st.success("API 設定已保存")
                 st.rerun()
@@ -103,18 +116,24 @@ def render_api_settings():
             if st.button("測試連線"):
                 if not api_key or not api_secret:
                     st.error("請先填入 API Key 和 Secret")
+                elif config.exchange_type == "bitget" and not api_password:
+                    st.error("Bitget 需要填入 Passphrase")
                 else:
-                    test_api_connection(api_key, api_secret, config.exchange_type)
+                    test_api_connection(api_key, api_secret, config.exchange_type, api_password)
 
 
-def test_api_connection(api_key: str, api_secret: str, exchange_type: str = "binance"):
+def test_api_connection(api_key: str, api_secret: str, exchange_type: str = "binance", password: str = ""):
     """測試 API 連線 (使用 Adapter)"""
     try:
         from exchanges import get_adapter, get_exchange_display_name
 
         with st.spinner(f"連接 {get_exchange_display_name(exchange_type)}..."):
             adapter = get_adapter(exchange_type)
-            adapter.init_exchange(api_key, api_secret)
+            # Bitget 需要額外的 password 參數
+            if exchange_type == "bitget":
+                adapter.init_exchange(api_key, api_secret, password=password)
+            else:
+                adapter.init_exchange(api_key, api_secret)
             adapter.load_markets()
 
             balances = adapter.fetch_balance()
