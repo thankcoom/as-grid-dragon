@@ -55,7 +55,7 @@ def normalize_symbol(symbol_input: str) -> Tuple[Optional[str], Optional[str], O
         
         如果無法識別，返回 (None, None, None, None)
     """
-    s = symbol_input.upper().strip().replace("/", "").replace(":", "").replace("-", "")
+    s = symbol_input.upper().strip().replace("/", "").replace(":", "").replace("-", "").replace("_", "")
 
     if s in SYMBOL_MAP:
         ccxt_sym = SYMBOL_MAP[s]

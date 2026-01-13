@@ -30,32 +30,17 @@ from indicators.funding import FundingRateManager, GLFTController
 from indicators.dgt import DGTBoundaryManager, DynamicGridManager
 
 # 多交易所支援
+from exchanges.bybit import BybitAdapter
+from exchanges.gate import GateAdapter
 from exchanges import get_adapter, ExchangeAdapter
 from exchanges.base import WSMessageType
+
+from utils import normalize_symbol
 
 logger = logging.getLogger("as_grid_max")
 
 
-def normalize_symbol(symbol: str) -> str:
-    """
-    標準化交易對符號，處理各交易所不同格式
 
-    Examples:
-        XRPUSDT -> XRPUSDT
-        XRP_USDT -> XRPUSDT
-        XRP/USDT:USDT -> XRPUSDT
-        xrpusdt -> XRPUSDT
-    """
-    # 移除分隔符並轉大寫
-    s = symbol.upper().replace("_", "").replace("/", "").replace(":", "")
-
-    # 處理 CCXT 格式中重複的結算幣種 (如 XRPUSDTUSDT -> XRPUSDT)
-    for quote in ["USDT", "USDC", "BUSD"]:
-        if s.endswith(quote + quote):
-            s = s[:-len(quote)]
-            break
-
-    return s
 
 
 class MaxGridBot:
@@ -104,19 +89,38 @@ class MaxGridBot:
         migrated = False
         new_symbols = {}
         for key, sym_cfg in list(self.config.symbols.items()):
-            # 如果 Key 不等於 ccxt_symbol，且 adapter 轉換後也不等於 Key (確保不是錯誤的配置)
-            if key != sym_cfg.ccxt_symbol:
-                logger.warning(f"[Bot] 遷移配置 Key: {key} -> {sym_cfg.ccxt_symbol}")
-                new_symbols[sym_cfg.ccxt_symbol] = sym_cfg
+            # 使用 normalize_symbol 重新解析，確保資料正確
+            _, real_ccxt, _, _ = normalize_symbol(key)
+            
+            # 如果解析失敗，嘗試用 ccxt_symbol 解析
+            if not real_ccxt:
+                _, real_ccxt, _, _ = normalize_symbol(sym_cfg.ccxt_symbol)
+
+            # 遷移判定: (Key 不正確) 或 (Config 內的 ccxt_symbol 不正確)
+            if real_ccxt and (key != real_ccxt or sym_cfg.ccxt_symbol != real_ccxt):
+                logger.warning(f"[Bot] 遷移配置: {key} -> {real_ccxt}")
+                
+                # 修正 Config 對象內的數據
+                sym_cfg.ccxt_symbol = real_ccxt
+                
+                # 使用正確的 Key 存儲
+                new_symbols[real_ccxt] = sym_cfg
                 migrated = True
             else:
+                # 已經正確，直接保留
                 new_symbols[key] = sym_cfg
         
         if migrated:
             self.config.symbols = new_symbols
-            # 這裡不直接調用 save_config (web端負責保存)，但在核心運行時更新內存配置是必要的
-            # 如果希望持久化，可以調用 web.state.save_config (但這裡沒有引入)
-            # 暫時依賴用戶下次在 Web 保存，或期待 Bot 運行期間正確使用新 Key
+            logger.info(f"[Bot] 配置遷移完成，新 Key: {list(new_symbols.keys())}")
+
+        # === 初始化 State Symbols (關鍵: 確保 State 中有 Key 才能接收更新) ===
+        for sym_cfg in self.config.symbols.values():
+            if sym_cfg.enabled:
+                if sym_cfg.ccxt_symbol not in self.state.symbols:
+                    self.state.symbols[sym_cfg.ccxt_symbol] = SymbolState(symbol=sym_cfg.ccxt_symbol)
+                # 確保 Config 引用正確 (選填)
+                pass
 
         # === 舊版兼容: 保留 self.exchange 引用 ===
         self.exchange = self.adapter.exchange
@@ -194,10 +198,10 @@ class MaxGridBot:
             positions = self.adapter.fetch_positions()
             for pos in positions:
                 # 使用標準化 symbol 匹配
-                normalized_sym = normalize_symbol(pos.symbol)
+                normalized_sym = normalize_symbol(pos.symbol)[0]
                 ccxt_symbol = None
                 for cfg in self.config.symbols.values():
-                    cfg_normalized = normalize_symbol(cfg.symbol)
+                    cfg_normalized = normalize_symbol(cfg.symbol)[0]
                     if cfg_normalized == normalized_sym:
                         ccxt_symbol = cfg.ccxt_symbol
                         break
@@ -459,9 +463,9 @@ class MaxGridBot:
 
         # 找到對應的 ccxt_symbol (處理不同交易所的 symbol 格式)
         ccxt_symbol = None
-        normalized_symbol = normalize_symbol(symbol)
+        normalized_symbol = normalize_symbol(symbol)[0]
         for cfg in self.config.symbols.values():
-            cfg_normalized = normalize_symbol(cfg.symbol)
+            cfg_normalized = normalize_symbol(cfg.symbol)[0]
             if cfg_normalized == normalized_symbol:
                 ccxt_symbol = cfg.ccxt_symbol
                 break
@@ -512,7 +516,7 @@ class MaxGridBot:
             ccxt_symbol = None
             normalized_symbol = pos.symbol.upper().replace("_", "").replace("/", "").replace(":", "")
             for cfg in self.config.symbols.values():
-                cfg_normalized = normalize_symbol(cfg.symbol)
+                cfg_normalized = normalize_symbol(cfg.symbol)[0]
                 if cfg_normalized == normalized_symbol:
                     ccxt_symbol = cfg.ccxt_symbol
                     break
@@ -547,10 +551,10 @@ class MaxGridBot:
             ticker_update: exchanges.base.TickerUpdate 實例
         """
         # 標準化 symbol 進行比對
-        normalized_raw = normalize_symbol(raw_symbol)
+        normalized_raw = normalize_symbol(raw_symbol)[0]
         matched = False
         for cfg in self.config.symbols.values():
-            cfg_normalized = normalize_symbol(cfg.symbol)
+            cfg_normalized = normalize_symbol(cfg.symbol)[0]
             
             if cfg_normalized == normalized_raw and cfg.ccxt_symbol in self.state.symbols:
                 matched = True
