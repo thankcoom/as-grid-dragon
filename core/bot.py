@@ -646,7 +646,6 @@ class MaxGridBot:
                 sym_state.buy_short_orders = 0
         
         # === 關鍵: 成交後立即重掛網格 (與終端版一致) ===
-        # 確保成交後立即調整網格，而不是等下一個 Ticker
         cfg = None
         for c in self.config.symbols.values():
             if c.ccxt_symbol == ccxt_symbol:
@@ -654,6 +653,41 @@ class MaxGridBot:
                 break
         
         if cfg:
+            # 策略: 優先使用訂單數據推算持倉變化，必要時才 REST 查詢
+            # 這樣既快速又準確
+            
+            # 根據成交訂單推算持倉變化
+            position_side_str = order_update.position_side.upper()
+            
+            if position_side_str == 'LONG':
+                if side == 'BUY':  # 多頭開倉/加倉
+                    sym_state.long_position += qty
+                    # 更新均價 (簡化: 用成交價近似)
+                    if sym_state.long_position > 0:
+                        old_value = (sym_state.long_position - qty) * sym_state.long_avg_price
+                        new_value = old_value + (qty * price)
+                        sym_state.long_avg_price = new_value / sym_state.long_position
+                elif side == 'SELL':  # 多頭平倉
+                    sym_state.long_position = max(0, sym_state.long_position - qty)
+                    if sym_state.long_position == 0:
+                        sym_state.long_avg_price = 0
+            
+            elif position_side_str == 'SHORT':
+                if side == 'SELL':  # 空頭開倉/加倉
+                    sym_state.short_position += qty
+                    # 更新均價
+                    if sym_state.short_position > 0:
+                        old_value = (sym_state.short_position - qty) * sym_state.short_avg_price
+                        new_value = old_value + (qty * price)
+                        sym_state.short_avg_price = new_value / sym_state.short_position
+                elif side == 'BUY':  # 空頭平倉
+                    sym_state.short_position = max(0, sym_state.short_position - qty)
+                    if sym_state.short_position == 0:
+                        sym_state.short_avg_price = 0
+            
+            logger.debug(f"[Bot] 推算持倉: {cfg.symbol} 多:{sym_state.long_position:.1f} 空:{sym_state.short_position:.1f}")
+            
+            # 立即重掛網格（使用推算的持倉數據）
             await self._adjust_grid(cfg)
             logger.debug(f"[Bot] 成交後重掛網格: {cfg.symbol}")
 
