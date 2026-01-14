@@ -558,11 +558,42 @@ class MaxGridBot:
             trade_side = "long" if side == "SELL" else "short"  # 減倉方向相反
             self.bandit_optimizer.record_trade(realized_pnl, trade_side)
             logger.debug(f"[Bandit] 記錄交易: {trade_side} pnl={realized_pnl:.4f}")
+        
+        # === 關鍵: DGT 累積利潤 (與終端版一致) ===
+        if self.config.dgt.enabled and realized_pnl != 0:
+            self.dgt_manager.accumulated_profits[ccxt_symbol] = \
+                self.dgt_manager.accumulated_profits.get(ccxt_symbol, 0) + realized_pnl
 
         # === 關鍵: 呼叫領先指標記錄 ===
         if self.config.leading_indicator.enabled:
             trade_side = "buy" if side == "BUY" else "sell"
             self.leading_indicator.record_trade(ccxt_symbol, price, qty, trade_side)
+        
+        # === 關鍵: 更新掛單計數器 (與終端版一致) ===
+        # 根據成交的訂單類型清零對應的掛單計數
+        position_side = order_update.position_side.upper()  # LONG / SHORT
+        if position_side == 'LONG':
+            if side == 'BUY':
+                sym_state.buy_long_orders = 0
+            else:  # SELL
+                sym_state.sell_long_orders = 0
+        elif position_side == 'SHORT':
+            if side == 'SELL':
+                sym_state.sell_short_orders = 0
+            else:  # BUY
+                sym_state.buy_short_orders = 0
+        
+        # === 關鍵: 成交後立即重掛網格 (與終端版一致) ===
+        # 確保成交後立即調整網格，而不是等下一個 Ticker
+        cfg = None
+        for c in self.config.symbols.values():
+            if c.ccxt_symbol == ccxt_symbol:
+                cfg = c
+                break
+        
+        if cfg:
+            await self._adjust_grid(cfg)
+            logger.debug(f"[Bot] 成交後重掛網格: {cfg.symbol}")
 
     async def _handle_account_update(self, account_update):
         """
